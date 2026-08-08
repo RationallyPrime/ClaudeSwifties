@@ -1,0 +1,19 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Aggregator
+aggregator/node_modules/
+aggregator/.data/
+aggregator/.env
+
+# macOS
+.DS_Store

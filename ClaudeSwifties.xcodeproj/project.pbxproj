@@ -1,0 +1,433 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		100000000000000000000141 /* UsageKit in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000131 /* UsageKit */; };
+		100000000000000000000142 /* UsageUI in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000132 /* UsageUI */; };
+		100000000000000000000143 /* UsageKit in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000133 /* UsageKit */; };
+		100000000000000000000144 /* UsageUI in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000134 /* UsageUI */; };
+		100000000000000000000145 /* UsageWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 1000000000000000000000C2 /* UsageWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		100000000000000000000152 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1000000000000000000000A1 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1000000000000000000000B2;
+			remoteInfo = UsageWidget;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		1000000000000000000000F7 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				100000000000000000000145 /* UsageWidget.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		1000000000000000000000C1 /* ClaudeSwifties.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ClaudeSwifties.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1000000000000000000000C2 /* UsageWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = UsageWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		1000000000000000000000E3 /* Widget-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Widget-Info.plist"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		1000000000000000000000D1 /* App */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			explicitFileTypes = {
+			};
+			explicitFolders = (
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		1000000000000000000000D2 /* Widget */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			explicitFileTypes = {
+			};
+			explicitFolders = (
+			);
+			path = Widget;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		1000000000000000000000F3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000141 /* UsageKit in Frameworks */,
+				100000000000000000000142 /* UsageUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000F4 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				100000000000000000000143 /* UsageKit in Frameworks */,
+				100000000000000000000144 /* UsageUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1000000000000000000000E1 = {
+			isa = PBXGroup;
+			children = (
+				1000000000000000000000D1 /* App */,
+				1000000000000000000000D2 /* Widget */,
+				1000000000000000000000E3 /* Widget-Info.plist */,
+				1000000000000000000000E2 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		1000000000000000000000E2 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1000000000000000000000C1 /* ClaudeSwifties.app */,
+				1000000000000000000000C2 /* UsageWidget.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1000000000000000000000B1 /* ClaudeSwifties */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000102 /* Build configuration list for PBXNativeTarget "ClaudeSwifties" */;
+			buildPhases = (
+				1000000000000000000000F1 /* Sources */,
+				1000000000000000000000F3 /* Frameworks */,
+				1000000000000000000000F5 /* Resources */,
+				1000000000000000000000F7 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				100000000000000000000151 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				1000000000000000000000D1 /* App */,
+			);
+			name = ClaudeSwifties;
+			packageProductDependencies = (
+				100000000000000000000131 /* UsageKit */,
+				100000000000000000000132 /* UsageUI */,
+			);
+			productName = ClaudeSwifties;
+			productReference = 1000000000000000000000C1 /* ClaudeSwifties.app */;
+			productType = "com.apple.product-type.application";
+		};
+		1000000000000000000000B2 /* UsageWidget */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000103 /* Build configuration list for PBXNativeTarget "UsageWidget" */;
+			buildPhases = (
+				1000000000000000000000F2 /* Sources */,
+				1000000000000000000000F4 /* Frameworks */,
+				1000000000000000000000F6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				1000000000000000000000D2 /* Widget */,
+			);
+			name = UsageWidget;
+			packageProductDependencies = (
+				100000000000000000000133 /* UsageKit */,
+				100000000000000000000134 /* UsageUI */,
+			);
+			productName = UsageWidget;
+			productReference = 1000000000000000000000C2 /* UsageWidget.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1000000000000000000000A1 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2660;
+				LastUpgradeCheck = 2660;
+				TargetAttributes = {
+					1000000000000000000000B1 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+					1000000000000000000000B2 = {
+						CreatedOnToolsVersion = 26.6;
+					};
+				};
+			};
+			buildConfigurationList = 100000000000000000000101 /* Build configuration list for PBXProject "ClaudeSwifties" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 1000000000000000000000E1;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				100000000000000000000121 /* XCLocalSwiftPackageReference "UsageKit" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 1000000000000000000000E2 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1000000000000000000000B1 /* ClaudeSwifties */,
+				1000000000000000000000B2 /* UsageWidget */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1000000000000000000000F5 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000F6 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1000000000000000000000F1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1000000000000000000000F2 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		100000000000000000000151 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1000000000000000000000B2 /* UsageWidget */;
+			targetProxy = 100000000000000000000152 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		100000000000000000000111 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		100000000000000000000112 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		100000000000000000000113 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOL_FRAMEWORKS = SwiftUI;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Claude usage";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = is.sokrates.ClaudeSwifties;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		100000000000000000000114 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOL_FRAMEWORKS = SwiftUI;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Claude usage";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = is.sokrates.ClaudeSwifties;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		100000000000000000000115 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = "Widget-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = is.sokrates.ClaudeSwifties.UsageWidget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		100000000000000000000116 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = "Widget-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = is.sokrates.ClaudeSwifties.UsageWidget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		100000000000000000000101 /* Build configuration list for PBXProject "ClaudeSwifties" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000111 /* Debug */,
+				100000000000000000000112 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000102 /* Build configuration list for PBXNativeTarget "ClaudeSwifties" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000113 /* Debug */,
+				100000000000000000000114 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000103 /* Build configuration list for PBXNativeTarget "UsageWidget" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				100000000000000000000115 /* Debug */,
+				100000000000000000000116 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		100000000000000000000121 /* XCLocalSwiftPackageReference "UsageKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = UsageKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		100000000000000000000131 /* UsageKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = UsageKit;
+		};
+		100000000000000000000132 /* UsageUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = UsageUI;
+		};
+		100000000000000000000133 /* UsageKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = UsageKit;
+		};
+		100000000000000000000134 /* UsageUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = UsageUI;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 1000000000000000000000A1 /* Project object */;
+}

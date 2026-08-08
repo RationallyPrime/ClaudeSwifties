@@ -1,0 +1,16 @@
+{
+  "name": "@skrates/usage-aggregator",
+  "version": "0.1.0",
+  "description": "Last-known-good Claude usage per account, pushed by edges and read by the widget",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}
