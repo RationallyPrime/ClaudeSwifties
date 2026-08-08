@@ -50,12 +50,78 @@ private struct UsageWidgetView: View {
     let entry: UsageEntry
 
     var body: some View {
-        UsageSummaryView(
-            snapshot: entry.snapshot,
-            now: entry.date,
-            maxAccounts: family == .systemMedium ? 3 : 6
-        )
-        .containerBackground(.fill.tertiary, for: .widget)
+        VStack(alignment: .leading, spacing: family == .systemMedium ? 5 : 10) {
+            header
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
+
+            UsageSummaryView(
+                snapshot: entry.snapshot,
+                now: entry.date,
+                maxAccounts: family == .systemMedium ? 4 : 6,
+                style: family == .systemMedium ? .compact : .widgetGrid
+            )
+        }
+        .containerBackground(for: .widget) {
+            widgetBackground
+        }
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [
+                            UsageTheme.accent(for: .claude),
+                            UsageTheme.accent(for: .codex),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            Text("AI LIMITS")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .tracking(1.1)
+                .foregroundStyle(.white.opacity(0.72))
+
+            Spacer()
+
+            if let count = entry.snapshot?.accounts.count {
+                Text("\(count) \(count == 1 ? "account" : "accounts")")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.38))
+            }
+        }
+    }
+
+    private var widgetBackground: some View {
+        ZStack {
+            UsageTheme.canvas
+
+            RadialGradient(
+                colors: [
+                    UsageTheme.accent(for: .codex).opacity(0.20),
+                    .clear,
+                ],
+                center: .topTrailing,
+                startRadius: 0,
+                endRadius: 190
+            )
+
+            RadialGradient(
+                colors: [
+                    UsageTheme.accent(for: .claude).opacity(0.13),
+                    .clear,
+                ],
+                center: .bottomLeading,
+                startRadius: 0,
+                endRadius: 180
+            )
+        }
     }
 }
 
