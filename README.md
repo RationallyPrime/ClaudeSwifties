@@ -136,18 +136,22 @@ requires the private read bearer.
 
 ## Collect Claude
 
-Create `~/.config/claude-usage/config` on every Claude machine:
+On every Claude machine, pass that edge's distinct identity and the ingest
+credential to the installer:
 
 ```bash
-USAGE_ACCOUNT_ID=claude-team
-USAGE_LABEL="Claude · Team"
-USAGE_ENDPOINT=https://your-host/v1/ingest
-USAGE_TOKEN=replace-with-ingest-token
+USAGE_ACCOUNT_ID=claude-team \
+USAGE_LABEL="Claude · Team" \
+USAGE_ENDPOINT=https://your-host/v1/ingest \
+USAGE_TOKEN=replace-with-ingest-token \
+edge/install-claude-collector.sh
 ```
 
-Configure Claude Code's `statusLine` command to run the absolute path to
-`edge/statusline-usage.sh`. The script still renders a status line when the
-network, configuration, or `jq` is unavailable.
+The installer copies the script to `~/.local/libexec/ai-usage`, writes a
+mode-600 config, preserves the previous Claude settings, and points Claude
+Code's `statusLine` at the installed copy. The collector uses `jq` when present
+and Python otherwise; a network or configuration failure cannot break the
+prompt.
 
 Claude's `rate_limits` values appear only after a session has received a model
 response. The script caches the last payload locally, but a cache is not a
@@ -227,7 +231,7 @@ cd aggregator && bun install --frozen-lockfile && bun test && bun run check
 ```
 
 ```bash
-cd edge && python3 -m unittest -v test_codex_usage.py
+cd edge && python3 -m unittest -v
 ```
 
 ```bash
