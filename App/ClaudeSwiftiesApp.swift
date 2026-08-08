@@ -7,7 +7,7 @@ struct ClaudeSwiftiesApp: App {
             ContentView()
         }
         #if os(macOS)
-            .defaultSize(width: 460, height: 520)
+            .defaultSize(width: 500, height: 700)
         #endif
     }
 }
