@@ -11,9 +11,19 @@ function account(id: string, asOf = "2026-08-07T21:38:12.000Z"): AccountUsage {
   return {
     id,
     label: id,
+    provider: "claude",
     source_host: "edge",
     as_of: asOf,
     status: "ok",
+    windows: [
+      {
+        id: "five-hour",
+        label: "5h",
+        duration_minutes: 300,
+        utilization: 0.4,
+        resets_at: "2026-08-07T23:10:00.000Z",
+      },
+    ],
     five_hour: { utilization: 0.4, resets_at: "2026-08-07T23:10:00.000Z" },
     seven_day: null,
   };

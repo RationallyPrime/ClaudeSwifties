@@ -16,9 +16,8 @@ public struct FreshnessPolicy: Sendable, Equatable {
         self.agingWithin = agingWithin
     }
 
-    /// Tuned to the phone, which is the slow link: WidgetKit grants roughly
-    /// 40-70 timeline refreshes a day, so ~15 minutes is the best a tile can
-    /// realistically be regardless of how fast the edges push.
+    /// The widget asks for a refresh every 15 minutes, though WidgetKit remains
+    /// free to coalesce that schedule. Older readings stay visible but dim.
     public static let `default` = FreshnessPolicy(freshWithin: 15 * 60, agingWithin: 60 * 60)
 }
 
@@ -39,35 +38,9 @@ public enum TileState: Sendable, Equatable {
     }
 }
 
-extension UsageWindow {
-    /// True when the window boundary fell between the reading and now.
-    ///
-    /// This is the one case where a stale number is not merely untrustworthy
-    /// but known-obsolete in a specific direction: the window rolled over, so
-    /// whatever it said before, it is empty now. Lets an idle tile answer
-    /// "have I recovered yet?" — which the statusline ingress cannot, since it
-    /// only reports while a session is live.
-    public func hasResetSince(_ readingTime: Date, now: Date) -> Bool {
-        resetsAt > readingTime && resetsAt <= now
-    }
-
-    /// Utilization corrected for a window that has since reset.
-    public func effectiveFraction(readingTime: Date, now: Date) -> Double {
-        hasResetSince(readingTime, now: now) ? 0 : fraction
-    }
-}
-
 extension AccountUsage {
     public func age(now: Date) -> TimeInterval {
         max(0, now.timeIntervalSince(asOf))
-    }
-
-    /// A stale reading whose windows have all rolled over is effectively
-    /// current again, and should be rendered with confidence rather than greyed.
-    public func isSupersededByReset(now: Date) -> Bool {
-        let windows = [fiveHour, sevenDay].compactMap(\.self)
-        guard !windows.isEmpty else { return false }
-        return windows.allSatisfy { $0.hasResetSince(asOf, now: now) }
     }
 
     public func freshness(now: Date, policy: FreshnessPolicy = .default) -> Freshness {
@@ -83,14 +56,7 @@ extension AccountUsage {
         case .error: .error
         case .unknown: .unknown
         case .ok, .stale:
-            if status == .ok, isSupersededByReset(now: now) {
-                // Old reading, but every window has rolled over since — we know
-                // the answer is zero without needing a newer one. Deliberately
-                // gated on `.ok`: an edge reporting `.stale` is disclaiming its
-                // own data, and that includes the `resets_at` this inference
-                // would be computing from.
-                .live(.fresh)
-            } else if status == .stale {
+            if status == .stale {
                 // A `.stale` edge report can only ever be worse than the clock
                 // says, never better, so take the pessimistic reading of the two.
                 .live(max(freshness(now: now, policy: policy), .aging))

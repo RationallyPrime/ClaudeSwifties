@@ -1,7 +1,7 @@
 {
   "name": "@skrates/usage-aggregator",
   "version": "0.1.0",
-  "description": "Last-known-good Claude usage per account, pushed by edges and read by the widget",
+  "description": "Last-known-good Claude and Codex usage, pushed by collectors and read by Apple widgets",
   "private": true,
   "type": "module",
   "scripts": {

@@ -1,16 +1,23 @@
 import Foundation
 
-/// Shared state between the app and the widget extension, which are separate
-/// processes and can only talk through an App Group container.
-///
-/// The cached snapshot matters more here than in most widgets: the aggregator
-/// lives on a tailnet, so a phone with the VPN off cannot reach it at all. In
-/// that state the widget must show the last good reading with an honest age
-/// rather than an error.
+public enum UsageRefreshState: Sendable, Equatable {
+    case unconfigured
+    case live(UsageSnapshot)
+    case cached(UsageSnapshot, message: String)
+    case failed(message: String)
+
+    public var snapshot: UsageSnapshot? {
+        switch self {
+        case .live(let snapshot), .cached(let snapshot, _): snapshot
+        case .unconfigured, .failed: nil
+        }
+    }
+}
+
+/// Shared state between the host app and widget extension. The App Group is a
+/// functional requirement: silently falling back to per-process defaults makes
+/// the host appear configured while the widget remains empty.
 public struct UsageStore: Sendable {
-    // `UserDefaults` is documented as thread-safe but predates `Sendable`, so
-    // the compiler can't see it. The store crosses an async boundary in
-    // `refresh(using:)`, which is what makes the conformance necessary.
     nonisolated(unsafe) private let defaults: UserDefaults
 
     private enum Key {
@@ -20,6 +27,11 @@ public struct UsageStore: Sendable {
     }
 
     public init?(appGroup: String) {
+        #if os(iOS) || os(macOS)
+        guard FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroup
+        ) != nil else { return nil }
+        #endif
         guard let defaults = UserDefaults(suiteName: appGroup) else { return nil }
         self.defaults = defaults
     }
@@ -33,8 +45,8 @@ public struct UsageStore: Sendable {
         nonmutating set { defaults.set(newValue?.absoluteString, forKey: Key.endpoint) }
     }
 
-    /// Not a credential store. This is a bearer token for the user's own
-    /// tailnet-local aggregator; anything sensitive belongs in the Keychain.
+    /// A secret for the read-only usage feed. It lives in the sandboxed App
+    /// Group because the widget process must be able to read it too.
     public var token: String? {
         get { defaults.string(forKey: Key.token) }
         nonmutating set { defaults.set(newValue, forKey: Key.token) }
@@ -50,33 +62,54 @@ public struct UsageStore: Sendable {
         defaults.set(data, forKey: Key.snapshot)
     }
 
-    /// The App Group shared by the host app and the widget extension. Both
-    /// resolve their store and provider through here so they cannot disagree
-    /// about where the endpoint or the cache lives.
     public static let defaultAppGroup = "group.is.sokrates.claudeswifties"
 
-    /// Falls back to standard defaults when the App Group entitlement isn't
-    /// configured yet, so the app runs before provisioning is sorted out.
-    public static func shared() -> UsageStore {
-        UsageStore(appGroup: defaultAppGroup) ?? UsageStore(defaults: .standard)
+    /// Returns nil when the signed target lacks the App Group entitlement. The
+    /// UI can then report the signing problem instead of showing demo data.
+    public static func shared() -> UsageStore? {
+        UsageStore(appGroup: defaultAppGroup)
     }
 
-    /// The mock stands in until an aggregator endpoint is configured, which is
-    /// what lets the UI be developed before any of the backend exists.
-    public func resolvedProvider() -> any UsageProvider {
-        guard let endpoint else { return MockUsageProvider() }
+    public func resolvedProvider() -> (any UsageProvider)? {
+        guard let endpoint else { return nil }
         return HTTPUsageProvider(endpoint: endpoint, bearerToken: token)
     }
 
-    /// Fetches and caches, falling back to the last good snapshot. Returns nil
-    /// only when the network failed *and* nothing was ever cached.
-    public func refresh(using provider: any UsageProvider) async -> UsageSnapshot? {
+    public func refreshConfigured() async -> UsageRefreshState {
+        guard let provider = resolvedProvider() else { return .unconfigured }
+        return await refresh(using: provider)
+    }
+
+    /// Fetches and caches a current snapshot. A network failure can use the
+    /// last good value, but the result keeps that distinction visible to the
+    /// host app and to tests.
+    public func refresh(using provider: any UsageProvider) async -> UsageRefreshState {
         do {
             let snapshot = try await provider.fetch()
             save(snapshot)
-            return snapshot
+            return .live(snapshot)
         } catch {
-            return loadCached()
+            let message = Self.message(for: error)
+            if let cached = loadCached() {
+                return .cached(cached, message: message)
+            }
+            return .failed(message: message)
         }
+    }
+
+    private static func message(for error: any Error) -> String {
+        if let providerError = error as? UsageProviderError {
+            switch providerError {
+            case .badStatus(let status): return "Server returned HTTP \(status)."
+            case .notHTTP: return "The endpoint did not return an HTTP response."
+            }
+        }
+        if let urlError = error as? URLError {
+            return urlError.localizedDescription
+        }
+        if error is DecodingError {
+            return "The server returned an unsupported usage payload."
+        }
+        return error.localizedDescription
     }
 }

@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import type { AccountUsage, UsageSnapshot } from "./contract.js";
+import { parseAccount, type AccountUsage, type UsageSnapshot } from "./contract.js";
 
 interface StoredAccount {
   account: AccountUsage;
@@ -31,9 +31,16 @@ export class UsageStore {
   async load(): Promise<void> {
     try {
       const raw = await readFile(this.path, "utf8");
-      const parsed = JSON.parse(raw) as StoredAccount[];
-      for (const entry of parsed) {
-        if (entry?.account?.id) this.accounts.set(entry.account.id, entry);
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) throw new Error("stored usage state must be an array");
+      for (const value of parsed) {
+        if (typeof value !== "object" || value === null) {
+          throw new Error("stored usage entry must be an object");
+        }
+        const entry = value as Record<string, unknown>;
+        const account = parseAccount(entry.account);
+        const receivedAt = typeof entry.received_at === "string" ? entry.received_at : account.as_of;
+        this.accounts.set(account.id, { account, received_at: receivedAt });
       }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -58,13 +65,11 @@ export class UsageStore {
 
   snapshot(generatedAt: string): UsageSnapshot {
     return {
-      schema: 1,
+      schema: 2,
       generated_at: generatedAt,
-      // Deliberately NOT downgrading quiet accounts to `stale`. Silence is the
-      // normal state: the statusline ingress only reports while a session is
-      // live. The client already derives age from `as_of`, and marking `stale`
-      // here would suppress its window-reset inference — the one thing that
-      // lets an idle tile stay useful.
+      // Do not rewrite edge status. The client derives freshness from as_of and
+      // visibly dims old values; silence is common for Claude's status-line
+      // collector and must not erase the last reading.
       accounts: [...this.accounts.values()]
         .map((entry) => entry.account)
         .sort((a, b) => a.id.localeCompare(b.id)),

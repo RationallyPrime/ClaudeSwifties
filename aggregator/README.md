@@ -1,72 +1,63 @@
 # usage-aggregator
 
-Holds the last-known-good usage reading per Claude account. Edges push; the
-widget reads. Nothing else.
+Stores the last validated reading for each Claude or Codex account. Collectors
+push; the Apple app and widget read one snapshot.
 
 ## Endpoints
 
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/health` | none | Coolify health check. Reveals only liveness. |
-| `POST` | `/v1/ingest` | `INGEST_TOKEN` | One account object, as emitted by `edge/statusline-usage.sh`. Upserts by `id`. |
-| `GET` | `/v1/usage` | `READ_TOKEN` | The full snapshot, in the contract the widget decodes. |
+| `GET` | `/health` | none | Liveness only |
+| `POST` | `/v1/ingest` | `INGEST_TOKEN` | Validate and upsert one account |
+| `GET` | `/v1/usage` | `READ_TOKEN` | Return the complete schema-2 snapshot |
 
-Two tokens, not one, because they have different blast radii: the ingest token
-sits in a shell config file on three machines, the read token sits on a phone.
-The service refuses to start if either is missing, under 16 characters, or if
-they are equal.
+The service refuses to start when either token is missing, shorter than 16
+characters, or equal to the other token. Ingest and read credentials are
+separate because they live on different machines and grant different authority.
 
-## Deploying
+Every response carries `Cache-Control: no-store`. Request bodies cap at 8 KiB,
+bearers are compared in constant time, account/window identifiers are bounded,
+timestamps must be ISO-8601 UTC instants, and all usage values must be finite
+fractions from 0 to 1.
 
-Currently running on a temporary host over a private tailnet with a real TLS
-cert, pending a permanent home. That is deliberate and cheap to undo: the stored
-state is last-known-good cache that every edge rebuilds on its next live
-session, so relocating is a one-line `USAGE_ENDPOINT` change with nothing to
-migrate.
+## Persistence
 
-See [DEPLOY.md](DEPLOY.md). It is a Coolify **service** (compose resource) on
-cx43, exposed by a cloudflared sidecar — no published ports and no Traefik, per
-that box's conventions. [compose.yml](compose.yml) is the resource definition.
+`DATA_DIR/usage.json` is a tiny last-known-good store written through an atomic
+rename. Writes are serialized inside the process. Schema-1 stored accounts are
+validated and migrated in memory when schema 2 starts.
 
-Two things that are load-bearing rather than stylistic:
+The `/data` volume is load-bearing. Losing it does not lose credentials or a
+history database—there is no history—but every tile remains empty until its
+collector reports again.
 
-- **A volume at `/data`.** Without it, readings reset on every redeploy and every
-  tile goes blank until each edge next has a live session.
-- **`${VAR}` placeholders, never literal tokens, in compose.** Coolify
-  interpolates service envs at deploy time; a literal is served to the widget as
-  the string `${USAGE_READ_TOKEN}` and every fetch 401s.
+## Public exposure
 
-## Note on exposure
+A public URL lets an iPhone widget work without depending on a VPN. That trade
+is acceptable only with HTTPS and strong bearers. Interactive access products
+such as Cloudflare Access do not fit the widget extension because it cannot
+complete a browser login while refreshing a timeline.
 
-Reaching this over the public internet rather than the tailnet is a deliberate
-trade, not a straight win. A public hostname means the phone works anywhere
-without the VPN connected — which matters, because a widget that silently stops
-updating whenever Tailscale drops is worse than useless. The cost is an
-internet-reachable endpoint, which is why both endpoints are authenticated,
-tokens are compared in constant time, bodies cap at 8 KB, every field is
-validated, and the container has zero runtime dependencies.
-
-**It must stay bearer-only and never go behind CF Access.** A widget extension
-cannot complete an interactive auth flow, so CF Access in front of this would
-make the widget permanently unable to fetch. That is why the read token is 32
-random bytes rather than something memorable.
+The current temporary deployment uses a Tailscale Serve/Funnel proxy to a
+container bound only on `127.0.0.1:8080`. See [DEPLOY.md](DEPLOY.md).
 
 ## Local development
 
 ```bash
-INGEST_TOKEN=dev-ingest-0123456789 READ_TOKEN=dev-read-0123456789 \
-  DATA_DIR=./.data PORT=8099 bun run src/index.ts
+bun install --frozen-lockfile
+INGEST_TOKEN=dev-ingest-0123456789 \
+READ_TOKEN=dev-read-0123456789 \
+DATA_DIR=./.data PORT=8099 \
+bun run src/index.ts
 ```
 
 ```bash
 bun test
+bun run check
 ```
 
-## Design note: silence is not staleness
+## Freshness ownership
 
-The service deliberately does **not** downgrade a quiet account to
-`status: "stale"`. The statusline ingress only reports while a Claude Code
-session is live, so silence is the normal resting state, not a fault. The client
-derives age from `as_of` itself, and a server-side `stale` would suppress the
-widget's window-reset inference — the thing that lets an idle tile still answer
-"have I recovered yet?".
+The server preserves the edge-reported status and timestamp. The client computes
+age from `as_of`, dims stale readings, and never infers zero merely because an
+old reset boundary passed. Silence is normal for Claude's live-session
+status-line source; Codex can be polled while idle.
