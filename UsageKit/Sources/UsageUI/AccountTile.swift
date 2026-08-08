@@ -89,14 +89,16 @@ public struct AccountTile: View {
             providerBadge(size: 34, iconSize: 13)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(account.label)
+                Text(displayName)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                     .lineLimit(1)
 
-                Text(providerName)
+                Text(accountContext)
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(accent.opacity(0.92))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
 
             Spacer(minLength: 6)
@@ -139,7 +141,7 @@ public struct AccountTile: View {
         HStack(spacing: 7) {
             providerBadge(size: 22, iconSize: 9)
 
-            Text(account.label)
+            Text(displayName)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.white)
                 .lineLimit(1)
@@ -197,7 +199,7 @@ public struct AccountTile: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 7) {
                 providerBadge(size: 26, iconSize: 10)
-                Text(account.label)
+                Text(displayName)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white)
                     .lineLimit(2)
@@ -394,6 +396,20 @@ public struct AccountTile: View {
         case .codex: "Codex"
         case .unknown: "Usage provider"
         }
+    }
+
+    private var displayName: String {
+        switch account.id.lowercased() {
+        case "codex-mac": "Ariadne"
+        case "rp-max-20x": "Fable"
+        case "rp-team": "Gnomon"
+        case "sokrates-team": "Sokrates"
+        default: account.label
+        }
+    }
+
+    private var accountContext: String {
+        displayName == account.label ? providerName : account.label
     }
 
     private var providerIcon: String {
