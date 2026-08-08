@@ -14,7 +14,12 @@ Current topology:
 - Image: a locally built `usage-aggregator:<tag>`
 - Bind: `127.0.0.1:8080 → 8080`
 - Persistent volume: `usage-data:/data`
-- HTTPS: Tailscale Serve/Funnel at the machine's `.ts.net` name
+- Public HTTPS: Tailscale Funnel at
+  `https://agent-cx53.tail1f9f2e.ts.net`
+
+The client read URL is
+`https://agent-cx53.tail1f9f2e.ts.net/v1/usage`. It is public-reachable but
+still requires the read bearer; unauthenticated reads must return 401.
 
 The container runs as the image's unprivileged `bun` user. An existing volume
 created by the older root-running image needs a one-time ownership correction

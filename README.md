@@ -129,6 +129,11 @@ keep the ingest and read tokens distinct. See
 [`aggregator/README.md`](aggregator/README.md) for its threat model and
 [`aggregator/DEPLOY.md`](aggregator/DEPLOY.md) for the current host topology.
 
+The current personal deployment is live at
+`https://agent-cx53.tail1f9f2e.ts.net`. The app uses
+`https://agent-cx53.tail1f9f2e.ts.net/v1/usage`; that read endpoint still
+requires the private read bearer.
+
 ## Collect Claude
 
 Create `~/.config/claude-usage/config` on every Claude machine:
@@ -195,7 +200,8 @@ For the direct Xcode route:
 
 1. Open `ClaudeSwifties.xcodeproj`.
 2. In Xcode Settings → Accounts, sign into the Apple developer account for the
-   configured team. Change the team on both targets if needed.
+   configured team. This checkout is configured for Hákon's Personal Team;
+   another developer must select their own team.
 3. Keep the same App Group on both targets:
    `group.is.sokrates.claudeswifties`.
 4. On the iPhone, open Settings → Privacy & Security → Developer Mode, turn it
