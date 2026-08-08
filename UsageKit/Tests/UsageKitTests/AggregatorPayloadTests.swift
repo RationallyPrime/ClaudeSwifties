@@ -54,15 +54,14 @@ private let capturedResponse = """
     #expect(snapshot.accounts[1].sevenDay?.fraction == 0.08)
 }
 
-/// The first account's five-hour boundary had already passed when the reading
-/// was taken — that is a window the reading already accounts for, not a reset,
-/// so the tile must keep showing 42% rather than claiming zero.
-@Test func pastBoundaryInRealPayloadIsNotTreatedAsAReset() throws {
+/// A historical reset timestamp never licenses the client to invent a current
+/// zero; the reading remains the old 42.3% and its age carries the warning.
+@Test func pastBoundaryInRealPayloadDoesNotFabricateZero() throws {
     let snapshot = try JSONDecoder.usageDecoder()
         .decode(UsageSnapshot.self, from: Data(capturedResponse.utf8))
     let account = snapshot.accounts[0]
     let now = account.asOf.addingTimeInterval(10 * 60)
 
-    #expect(account.isSupersededByReset(now: now) == false)
-    #expect(account.fiveHour?.effectiveFraction(readingTime: account.asOf, now: now) == 0.423)
+    #expect(account.fiveHour?.fraction == 0.423)
+    #expect(account.tileState(now: now) == .live(.fresh))
 }

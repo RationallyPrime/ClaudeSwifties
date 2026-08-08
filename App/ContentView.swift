@@ -3,39 +3,71 @@ import UsageKit
 import UsageUI
 import WidgetKit
 
-/// Deliberately thin. WidgetKit requires a host app; the widget is the product.
-/// The one thing this screen must actually do is let you point the widget at an
-/// aggregator — without it there is no way to enter an endpoint at all, and the
-/// widget can only ever show sample data.
 struct ContentView: View {
-    @State private var snapshot: UsageSnapshot?
+    @State private var refreshState: UsageRefreshState = .unconfigured
     @State private var now = Date()
     @State private var endpoint = ""
     @State private var token = ""
+    @State private var validationMessage: String?
+    @State private var isRefreshing = false
     @State private var saved = false
 
     private let store = UsageStore.shared()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Claude usage")
-                .font(.headline)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
 
-            UsageSummaryView(snapshot: snapshot, now: now)
+                UsageSummaryView(
+                    snapshot: refreshState.snapshot,
+                    now: now,
+                    emptyMessage: "Configure the private feed below"
+                )
 
-            Divider()
-
-            settings
+                Divider()
+                settings
+            }
+            .padding()
+            .frame(maxWidth: 520, alignment: .leading)
         }
-        .padding()
         .task { await load() }
     }
 
-    private var settings: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Aggregator")
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("AI usage")
+                .font(.headline)
+
+            Spacer()
+            statusLabel
                 .font(.caption)
-                .fontWeight(.medium)
+        }
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        switch refreshState {
+        case .live:
+            Label("Live", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .cached:
+            Label("Cached", systemImage: "clock.badge.exclamationmark")
+                .foregroundStyle(.orange)
+        case .failed:
+            Label("Offline", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+        case .unconfigured:
+            Label("Setup", systemImage: "gearshape")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Private usage feed")
+                .font(.caption)
+                .fontWeight(.semibold)
 
             TextField("https://host/v1/usage", text: $endpoint)
                 .textFieldStyle(.roundedBorder)
@@ -46,17 +78,39 @@ struct ContentView: View {
                     .keyboardType(.URL)
                 #endif
 
-            // Secure because it is a bearer token for a service holding your
-            // usage history — not because it unlocks anything else.
             SecureField("read token", text: $token)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
 
+            Text("The read token and last snapshot are shared only with this app's widget extension.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if let validationMessage {
+                Text(validationMessage)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            } else if case .cached(_, let message) = refreshState {
+                Text("Showing the last good reading: \(message)")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            } else if case .failed(let message) = refreshState {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+
             HStack {
                 Button("Save & refresh") { Task { await save() } }
-                    .disabled(URL(string: endpoint)?.scheme == nil)
+                    .disabled(isRefreshing || store == nil)
 
-                if saved {
+                Button("Refresh") { Task { await refresh() } }
+                    .disabled(isRefreshing || store?.endpoint == nil)
+
+                if isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                } else if saved {
                     Text("saved")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -67,24 +121,68 @@ struct ContentView: View {
     }
 
     private func load() async {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--sample-usage") {
+            now = Date()
+            refreshState = .live(.sample(now: now))
+            return
+        }
+        #endif
+
+        guard let store else {
+            refreshState = .failed(
+                message: "The shared App Group is unavailable. Check signing entitlements for the app and widget."
+            )
+            return
+        }
         endpoint = store.endpoint?.absoluteString ?? ""
         token = store.token ?? ""
-        now = Date()
-        snapshot = await store.refresh(using: store.resolvedProvider())
+        await refresh()
     }
 
     private func save() async {
-        store.endpoint = URL(string: endpoint)
-        store.token = token.isEmpty ? nil : token
-        now = Date()
-        snapshot = await store.refresh(using: store.resolvedProvider())
-        // The widget is a separate process and won't notice the change on its
-        // own; without this you'd wait up to 15 minutes to see if it worked.
+        guard let store else { return }
+        validationMessage = nil
+
+        guard let url = validatedEndpoint() else { return }
+        guard token.count >= 16 else {
+            validationMessage = "The read token must be at least 16 characters."
+            return
+        }
+
+        store.endpoint = url
+        store.token = token
+        await refresh()
         WidgetCenter.shared.reloadAllTimelines()
 
         withAnimation { saved = true }
         try? await Task.sleep(for: .seconds(2))
         withAnimation { saved = false }
+    }
+
+    private func refresh() async {
+        guard let store else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
+        now = Date()
+        refreshState = await store.refreshConfigured()
+    }
+
+    private func validatedEndpoint() -> URL? {
+        guard let url = URL(string: endpoint),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host,
+              !host.isEmpty
+        else {
+            validationMessage = "Enter a complete HTTPS URL."
+            return nil
+        }
+
+        if scheme == "https" { return url }
+        if scheme == "http", ["localhost", "127.0.0.1", "::1"].contains(host) { return url }
+
+        validationMessage = "Use HTTPS for any non-local usage feed."
+        return nil
     }
 }
 

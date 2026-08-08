@@ -78,9 +78,21 @@ payload=$(printf '%s' "$input" | jq -c \
     {
       id: $id,
       label: $label,
+      provider: "claude",
       source_host: $host,
       as_of: $now,
       status: "ok",
+      windows: ([
+        (if $r.five_hour == null then null
+         else { id: "five-hour", label: "5h", duration_minutes: 300,
+                utilization: ($r.five_hour.used_percentage / 100),
+                resets_at: ($r.five_hour.resets_at | todate) } end),
+        (if $r.seven_day == null then null
+         else { id: "seven-day", label: "7d", duration_minutes: 10080,
+                utilization: ($r.seven_day.used_percentage / 100),
+                resets_at: ($r.seven_day.resets_at | todate) } end)
+      ] | map(select(. != null))),
+      # Compatibility fields for the currently deployed schema-1 aggregator.
       five_hour: (
         if $r.five_hour == null then null
         else { utilization: ($r.five_hour.used_percentage / 100),

@@ -41,6 +41,7 @@ private let contractJSON = """
 
     let first = snapshot.accounts[0]
     #expect(first.id == "sokrates-team")
+    #expect(first.provider == .claude)
     #expect(first.sourceHost == "timaeus-mbp")
     #expect(first.status == .ok)
     #expect(first.fiveHour?.fraction == 0.42)
@@ -48,6 +49,45 @@ private let contractJSON = """
     let second = snapshot.accounts[1]
     #expect(second.status == .authExpired)
     #expect(second.fiveHour == nil)
+}
+
+@Test func decodesProviderDefinedCodexWindows() throws {
+    let json = """
+    {
+      "schema": 2,
+      "generated_at": "2026-08-08T00:20:00Z",
+      "accounts": [{
+        "id": "codex-pro",
+        "label": "Codex · Pro",
+        "provider": "codex",
+        "source_host": "hakon-mbp",
+        "as_of": "2026-08-08T00:19:50Z",
+        "status": "ok",
+        "windows": [{
+          "id": "primary-10080m",
+          "label": "7d",
+          "duration_minutes": 10080,
+          "utilization": 0.45,
+          "resets_at": "2026-08-09T17:36:32Z"
+        }],
+        "five_hour": null,
+        "seven_day": {
+          "utilization": 0.45,
+          "resets_at": "2026-08-09T17:36:32Z"
+        }
+      }]
+    }
+    """
+
+    let snapshot = try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: Data(json.utf8))
+    let account = try #require(snapshot.accounts.first)
+
+    #expect(snapshot.schema == 2)
+    #expect(account.provider == .codex)
+    #expect(account.windows.count == 1)
+    #expect(account.windows[0].label == "7d")
+    #expect(account.windows[0].durationMinutes == 10_080)
+    #expect(account.windows[0].fraction == 0.45)
 }
 
 @Test func acceptsBothTimestampShapes() throws {
@@ -80,5 +120,6 @@ private let contractJSON = """
     let restored = try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: data)
 
     #expect(restored.accounts.map(\.id) == original.accounts.map(\.id))
+    #expect(restored.accounts[1].provider == .codex)
     #expect(restored.accounts[2].status == .authExpired)
 }

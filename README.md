@@ -1,132 +1,243 @@
-# ClaudeSwifties
+# AI Usage
 
-A widget for iOS and macOS showing subscription usage and reset times across
-three Claude accounts that live on three different machines.
+A native SwiftUI app and WidgetKit extension for iPhone and macOS that shows
+Claude and Codex subscription limits, reset times, and reading age.
 
-## How the numbers are obtained
+The Xcode project still uses the historical `ClaudeSwifties` product name, but
+the user-facing app and widget are called **AI Usage**.
 
-Claude Code's `statusLine` command receives a JSON payload on stdin that
-includes, for Pro/Max subscribers:
+## What is real today
 
-```
-rate_limits.five_hour.used_percentage    0–100
-rate_limits.five_hour.resets_at          unix epoch seconds
-rate_limits.seven_day.used_percentage
-rate_limits.seven_day.resets_at
-```
+- One multiplatform app target builds for iOS 17+ and macOS 14+.
+- One widget extension builds for both platforms.
+- The app and widget share endpoint settings, a read token, and the last good
+  snapshot through an App Group.
+- Claude Code readings arrive through its status-line JSON.
+- Codex readings come from Codex's own
+  [`account/rateLimits/read` app-server method](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#7-rate-limits-chatgpt).
+- A small authenticated aggregator keeps the last reading from every machine so
+  a phone widget can fetch one compact document.
 
-This is the entire data source. **No credential is read, stored, or refreshed
-by anything in this repo.** The numbers arrive as a documented part of a session
-that is already authenticated, on the machine that owns that account.
+No collector reads a browser cookie, copies an OAuth token, refreshes a token,
+or calls a private web endpoint directly. Claude and Codex remain the owners of
+their authenticated sessions.
 
-Rejected alternatives, and why:
+## Architecture
 
-- **Reading the OAuth token and calling `/api/oauth/usage`.** That endpoint is
-  real and returns the same fields, but it is undocumented, requires a
-  `User-Agent: claude-code/<version>` header to avoid a punitive rate-limit
-  bucket, and needs a credential per account. On macOS the keychain ACL also
-  makes unattended reads prompt. All of this to obtain data the statusline hands
-  over for free.
-- **Refreshing tokens from a poller.** If refresh tokens rotate, a poller
-  refreshing independently of the client that owns the credential can invalidate
-  a live session. Nothing here refreshes anything.
-- **`claude usage --json`.** Does not exist. The feature request
-  (anthropics/claude-code#44328) was closed as a duplicate.
-
-## Shape
-
-```
-edge (×3)                  aggregator            widget (iOS + macOS)
-statusLine shim  ──push──▶  timaeus devbox  ──GET──▶  three tiles
+```text
+Claude Code statusLine ─┐
+                        ├── authenticated push ──▶ usage aggregator ──▶ iOS/macOS app + widget
+Codex app-server RPC ───┘                         public HTTPS + read bearer
 ```
 
-Edges push; the aggregator never dials out. Two of the three edges are laptops
-that roam and sleep, so pull would not work for them.
+Edges push because laptops sleep and roam. The aggregator never dials into a
+machine, and it stores only the latest reading for each account.
 
-### Known gap
+## Design rules
 
-`rate_limits` only appears **after the first API response in a session**, and
-each window may be independently absent. So this is a live-session ingress: it
-cannot report while an account is idle. Two mitigations, both implemented:
+The display is deliberately conservative:
 
-- Each edge caches its last payload locally, so a cron fallback can ship the
-  last-known-good value with no session running.
-- Staleness is a first-class part of the data model rather than an error case.
-  Where a reading is old but every window's `resets_at` has since passed, the
-  widget infers the window is empty and renders with confidence instead of
-  greying out — see `AccountUsage.isSupersededByReset(now:)`.
+- A stale number stays visible with its age and reduced emphasis.
+- Passing a reset timestamp does **not** turn an old reading into zero. The
+  account may have been used after the reset without this collector seeing it.
+- An unconfigured app shows no readings. It never substitutes plausible demo
+  percentages for live data.
+- A failed refresh may fall back to the last good snapshot, but the host app
+  labels that result **Cached** and shows the failure.
+- Provider windows carry their own label and duration. The app no longer assumes
+  every service always exposes exactly a five-hour and seven-day pair.
 
-## Layout
+WidgetKit controls actual refresh execution. The extension requests a new
+timeline after 15 minutes; iOS or macOS may coalesce that request.
 
-| Path | What it is |
+## Repository layout
+
+| Path | Purpose |
 | --- | --- |
-| `UsageKit/Sources/UsageKit` | Contract types, staleness rules, formatting, providers, App Group store. Platform-free and fully tested. |
-| `UsageKit/Sources/UsageUI` | SwiftUI tiles, shared by the app and the widget so the two cannot drift. |
-| `App/` | The host app. Exists because WidgetKit requires one. |
-| `Widget/` | The widget extension. Timeline refreshes every 15 minutes — WidgetKit grants only ~40–70 a day. |
-| `edge/statusline-usage.sh` | The `statusLine` command. Renders the status line *and* forwards usage. Runs on every render, so it is fast, never blocks on the network, and never fails loudly. |
+| `UsageKit/Sources/UsageKit` | Wire model, decoding compatibility, freshness, HTTP provider, shared App Group store |
+| `UsageKit/Sources/UsageUI` | SwiftUI meters used by both the host app and widget |
+| `App/` | Multiplatform host app and per-platform entitlements |
+| `Widget/` | Multiplatform WidgetKit extension and per-platform entitlements |
+| `edge/statusline-usage.sh` | Claude status-line renderer and collector |
+| `edge/codex_usage.py` | Codex app-server collector; Python standard library only |
+| `edge/install-codex-collector.sh` | Installs the Codex collector as a five-minute macOS LaunchAgent |
+| `aggregator/` | Bun service, container, persistence, validation, and deployment notes |
 
-The Xcode project is hand-authored using filesystem-synchronized groups, so adding
-a file to `App/` or `Widget/` needs no project-file edit.
+## Usage contract
 
-```bash
-xcodebuild -scheme ClaudeSwifties -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
-```
-
-macOS is configured in the build settings (`SDKROOT = auto`) but not yet verified —
-a macOS widget must be sandboxed and signed to load into Notification Centre, which
-needs a development team set.
-
-## Contract
+Schema 2 adds provider identity and generic windows. The server also emits
+`five_hour` and `seven_day` compatibility fields when those durations are
+present, so a schema-1 app remains useful during rollout.
 
 ```json
 {
-  "schema": 1,
-  "generated_at": "2026-08-07T21:40:00Z",
+  "schema": 2,
+  "generated_at": "2026-08-08T00:20:00Z",
   "accounts": [
     {
-      "id": "sokrates-team",
-      "label": "Sokrates · Team",
-      "source_host": "timaeus-mbp",
-      "as_of": "2026-08-07T21:38:12Z",
+      "id": "codex-mac",
+      "label": "Codex · Pro",
+      "provider": "codex",
+      "source_host": "Mac",
+      "as_of": "2026-08-08T00:19:50Z",
       "status": "ok",
-      "five_hour": { "utilization": 0.42, "resets_at": "2026-08-07T23:10:00Z" },
-      "seven_day": { "utilization": 0.71, "resets_at": "2026-08-09T04:00:00Z" }
+      "windows": [
+        {
+          "id": "primary-10080m",
+          "label": "7d",
+          "duration_minutes": 10080,
+          "utilization": 0.45,
+          "resets_at": "2026-08-09T17:36:32Z"
+        }
+      ],
+      "five_hour": null,
+      "seven_day": {
+        "utilization": 0.45,
+        "resets_at": "2026-08-09T17:36:32Z"
+      }
     }
   ]
 }
 ```
 
-`status` is `ok | stale | auth_expired | error`; unrecognised values decode to
-`unknown` so a server-side addition degrades one tile rather than the widget.
-`utilization` is 0–1 here — the shim divides the payload's 0–100 percentage.
+`utilization` is used capacity from 0 to 1. `resets_at` may be null when a
+provider does not publish a boundary. Unknown account status or provider values
+degrade one tile rather than blanking the complete widget.
 
-## Edge setup
+## Run the aggregator
+
+Generate two different random tokens:
 
 ```bash
-mkdir -p ~/.config/claude-usage
-cat > ~/.config/claude-usage/config <<'EOF'
-USAGE_ACCOUNT_ID=rp-team
-USAGE_LABEL="Team · rationallyprime"
-USAGE_ENDPOINT=https://timaeus:8443/ingest
-USAGE_TOKEN=...
-EOF
+openssl rand -hex 32
+openssl rand -hex 32
 ```
 
-Then point `statusLine` at `edge/statusline-usage.sh` in that machine's Claude
-Code settings. With no `USAGE_ENDPOINT` set the shim still renders and caches
-locally, which is the way to try it before any aggregator exists.
+Then run locally:
 
-## Tests
+```bash
+cd aggregator
+bun install --frozen-lockfile
+INGEST_TOKEN=replace-with-ingest-token \
+READ_TOKEN=replace-with-read-token \
+DATA_DIR=./.data PORT=8099 \
+bun run src/index.ts
+```
+
+The production service must be behind HTTPS, retain its `/data` volume, and
+keep the ingest and read tokens distinct. See
+[`aggregator/README.md`](aggregator/README.md) for its threat model and
+[`aggregator/DEPLOY.md`](aggregator/DEPLOY.md) for the current host topology.
+
+## Collect Claude
+
+Create `~/.config/claude-usage/config` on every Claude machine:
+
+```bash
+USAGE_ACCOUNT_ID=claude-team
+USAGE_LABEL="Claude · Team"
+USAGE_ENDPOINT=https://your-host/v1/ingest
+USAGE_TOKEN=replace-with-ingest-token
+```
+
+Configure Claude Code's `statusLine` command to run the absolute path to
+`edge/statusline-usage.sh`. The script still renders a status line when the
+network, configuration, or `jq` is unavailable.
+
+Claude's `rate_limits` values appear only after a session has received a model
+response. The script caches the last payload locally, but a cache is not a
+current reading and the UI treats its age accordingly.
+
+## Collect Codex
+
+The Codex collector performs the normal app-server initialization handshake and
+then calls `account/rateLimits/read`. It prefers
+`rateLimitsByLimitId.codex` and uses the backwards-compatible `rateLimits`
+field only when needed.
+
+Try it without pushing:
+
+```bash
+edge/codex_usage.py --print --no-push
+```
+
+Configure `~/.config/codex-usage/config`:
+
+```bash
+CODEX_BIN="$HOME/.local/bin/codex"
+USAGE_ACCOUNT_ID=codex-mac
+USAGE_LABEL="Codex · Pro"
+USAGE_ENDPOINT=https://your-host/v1/ingest
+USAGE_TOKEN=replace-with-ingest-token
+```
+
+Install the five-minute LaunchAgent:
+
+```bash
+edge/install-codex-collector.sh
+```
+
+The installer copies the collector to `~/.local/libexec/ai-usage`, preserves
+the config on uninstall, and logs only errors to
+`~/Library/Logs/AIUsage/codex-usage.log`.
+
+## Put it on an iPhone
+
+A native iOS widget is not installed by hosting an `.app` on a web server.
+There are two routes:
+
+1. **Immediate development install:** connect the iPhone, enable Developer Mode,
+   select the phone in Xcode, and press Run.
+2. **Ongoing distribution:** archive and upload through App Store Connect, then
+   install through TestFlight or the App Store.
+
+For the direct Xcode route:
+
+1. Open `ClaudeSwifties.xcodeproj`.
+2. In Xcode Settings → Accounts, sign into the Apple developer account for the
+   configured team. Change the team on both targets if needed.
+3. Keep the same App Group on both targets:
+   `group.is.sokrates.claudeswifties`.
+4. On the iPhone, open Settings → Privacy & Security → Developer Mode, turn it
+   on, restart, confirm, and enter the device passcode.
+5. Select the iPhone as the run destination and run the `ClaudeSwifties`
+   scheme.
+6. In AI Usage, enter the aggregator's HTTPS `/v1/usage` URL and **read** token.
+7. Long-press the Home Screen, add the **AI usage** widget, and choose medium or
+   large.
+
+The app and extension both require the App Group provisioning entitlement.
+A compile-only build is not proof that settings will cross the process boundary;
+inspect the signed app and extension entitlements when diagnosing TestFlight.
+
+## Verify
 
 ```bash
 cd UsageKit && swift test
 ```
 
-## Not covered
+```bash
+cd aggregator && bun install --frozen-lockfile && bun test && bun run check
+```
 
-ChatGPT Pro and SuperGrok. Neither exposes subscription usage through anything
-supported — OpenAI's usage APIs cover platform API keys, which is separate
-billing from a ChatGPT subscription, and xAI does not publish consumer plan
-limits at all. Reaching either would mean lifting a browser session cookie.
-Those tiles stay absent rather than pretending.
+```bash
+cd edge && python3 -m unittest -v test_codex_usage.py
+```
+
+```bash
+xcodebuild -scheme ClaudeSwifties -project ClaudeSwifties.xcodeproj \
+  -destination 'generic/platform=iOS Simulator' build
+```
+
+```bash
+xcodebuild -scheme ClaudeSwifties -project ClaudeSwifties.xcodeproj \
+  -destination 'platform=macOS,arch=arm64' build
+```
+
+## Deliberately not covered
+
+The general OpenAI API usage endpoints report API-key billing, not a ChatGPT
+subscription. That does not make Codex limits unavailable: Codex exposes its
+ChatGPT-backed quota through its own app-server protocol, which is the source
+used here. SuperGrok remains absent because no supported local or public
+consumer-plan usage interface has been established.

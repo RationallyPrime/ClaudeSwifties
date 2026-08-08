@@ -31,9 +31,7 @@ struct UsageTimelineProvider: TimelineProvider {
         Task {
             let now = Date()
             let entry = UsageEntry(date: now, snapshot: await load())
-            // WidgetKit grants roughly 40-70 refreshes a day, so ~15 minutes is
-            // the sustainable floor. Polling the aggregator faster than this
-            // would buy nothing — the phone, not the pipeline, is the bottleneck.
+            // This is a request, not a guarantee; WidgetKit may coalesce it.
             let next = now.addingTimeInterval(15 * 60)
             completion(Timeline(entries: [entry], policy: .after(next)))
         }
@@ -42,18 +40,32 @@ struct UsageTimelineProvider: TimelineProvider {
     /// Never throws: an unreachable aggregator falls back to the cached
     /// snapshot, which the tiles then render with an honest age.
     private func load() async -> UsageSnapshot? {
-        await store.refresh(using: store.resolvedProvider())
+        guard let store else { return nil }
+        return await store.refreshConfigured().snapshot
+    }
+}
+
+private struct UsageWidgetView: View {
+    @Environment(\.widgetFamily) private var family
+    let entry: UsageEntry
+
+    var body: some View {
+        UsageSummaryView(
+            snapshot: entry.snapshot,
+            now: entry.date,
+            maxAccounts: family == .systemMedium ? 3 : 6
+        )
+        .containerBackground(.fill.tertiary, for: .widget)
     }
 }
 
 struct UsageWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: "UsageWidget", provider: UsageTimelineProvider()) { entry in
-            UsageSummaryView(snapshot: entry.snapshot, now: entry.date)
-                .containerBackground(.fill.tertiary, for: .widget)
+            UsageWidgetView(entry: entry)
         }
-        .configurationDisplayName("Claude usage")
-        .description("Limits and reset times across your accounts.")
+        .configurationDisplayName("AI usage")
+        .description("Claude and Codex limits with reset times.")
         .supportedFamilies([.systemMedium, .systemLarge])
     }
 }

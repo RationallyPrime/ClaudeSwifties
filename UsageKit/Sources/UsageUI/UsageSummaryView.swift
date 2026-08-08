@@ -6,17 +6,32 @@ import UsageKit
 public struct UsageSummaryView: View {
     private let snapshot: UsageSnapshot?
     private let now: Date
+    private let maxAccounts: Int?
+    private let emptyMessage: String
 
-    public init(snapshot: UsageSnapshot?, now: Date) {
+    public init(
+        snapshot: UsageSnapshot?,
+        now: Date,
+        maxAccounts: Int? = nil,
+        emptyMessage: String = "Open the app to configure the usage feed"
+    ) {
         self.snapshot = snapshot
         self.now = now
+        self.maxAccounts = maxAccounts
+        self.emptyMessage = emptyMessage
     }
 
     public var body: some View {
         if let snapshot, !snapshot.accounts.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(snapshot.accounts) { account in
+                ForEach(visibleAccounts(in: snapshot)) { account in
                     AccountTile(account: account, now: now)
+                }
+
+                if let maxAccounts, snapshot.accounts.count > maxAccounts {
+                    Text("+\(snapshot.accounts.count - maxAccounts) more in the app")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
         } else {
@@ -24,17 +39,19 @@ public struct UsageSummaryView: View {
                 Text("No readings")
                     .font(.caption)
                     .fontWeight(.medium)
-                // The likeliest cause by far, given the aggregator is only
-                // reachable over the tailnet.
-                Text("Check Tailscale is connected")
+                Text(emptyMessage)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
         }
     }
+
+    private func visibleAccounts(in snapshot: UsageSnapshot) -> [AccountUsage] {
+        Array(snapshot.accounts.prefix(maxAccounts ?? snapshot.accounts.count))
+    }
 }
 
-#Preview("Three accounts") {
+#Preview("Claude + Codex") {
     UsageSummaryView(snapshot: .sample(now: Date()), now: Date())
         .padding()
         .frame(width: 320)

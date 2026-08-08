@@ -1,9 +1,8 @@
 import SwiftUI
 import UsageKit
 
-/// One account. Renders three ways: live numbers, a dimmed stale reading with
-/// its age, or a no-data state — never a confident-looking number that is
-/// actually hours old.
+/// One provider/account. Old readings remain visible and explicitly dimmed;
+/// crossing a reset boundary never turns an old value into a made-up zero.
 public struct AccountTile: View {
     private let account: AccountUsage
     private let now: Date
@@ -24,9 +23,10 @@ public struct AccountTile: View {
         VStack(alignment: .leading, spacing: 5) {
             header
 
-            if state.showsNumbers {
-                window(account.fiveHour, caption: "5h")
-                window(account.sevenDay, caption: "7d")
+            if state.showsNumbers, !account.windows.isEmpty {
+                ForEach(account.windows.prefix(2)) { window in
+                    windowRow(window)
+                }
             } else {
                 Text(unavailableReason)
                     .font(.caption2)
@@ -37,7 +37,12 @@ public struct AccountTile: View {
     }
 
     private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 4) {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Image(systemName: providerIcon)
+                .font(.caption2)
+                .foregroundStyle(providerTint)
+                .accessibilityLabel(providerName)
+
             Text(account.label)
                 .font(.caption)
                 .fontWeight(.medium)
@@ -53,39 +58,64 @@ public struct AccountTile: View {
         }
     }
 
-    @ViewBuilder
-    private func window(_ window: UsageWindow?, caption: String) -> some View {
-        if let window {
-            let fraction = window.effectiveFraction(readingTime: account.asOf, now: now)
+    private func windowRow(_ window: UsageWindow) -> some View {
+        HStack(spacing: 6) {
+            Text(window.label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 25, alignment: .leading)
 
-            HStack(spacing: 6) {
-                Text(caption)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16, alignment: .leading)
+            UsageBar(fraction: window.fraction, dimmed: dimmed)
 
-                UsageBar(fraction: fraction, dimmed: dimmed)
+            Text(UsageFormat.percent(window.fraction))
+                .font(.caption2)
+                .monospacedDigit()
+                .frame(width: 34, alignment: .trailing)
 
-                Text(UsageFormat.percent(fraction))
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .frame(width: 34, alignment: .trailing)
-
-                Text(UsageFormat.countdown(to: window.resetsAt, from: now))
-                    .font(.caption2)
-                    .monospacedDigit()
-                    .foregroundStyle(.tertiary)
-                    .frame(width: 44, alignment: .trailing)
-            }
+            Text(resetText(for: window))
+                .font(.caption2)
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+                .frame(width: 48, alignment: .trailing)
         }
+    }
+
+    private func resetText(for window: UsageWindow) -> String {
+        guard let resetsAt = window.resetsAt else { return "—" }
+        guard resetsAt > now else { return "passed" }
+        return UsageFormat.countdown(to: resetsAt, from: now)
     }
 
     private var unavailableReason: String {
         switch state {
         case .authExpired: "sign in on \(account.sourceHost)"
-        case .error: "edge error · \(account.sourceHost)"
+        case .error: "collector error · \(account.sourceHost)"
         case .unknown: "unrecognised state"
-        case .live: ""
+        case .live: "No quota windows reported"
+        }
+    }
+
+    private var providerName: String {
+        switch account.provider {
+        case .claude: "Claude"
+        case .codex: "Codex"
+        case .unknown: "Usage provider"
+        }
+    }
+
+    private var providerIcon: String {
+        switch account.provider {
+        case .claude: "sparkles"
+        case .codex: "chevron.left.forwardslash.chevron.right"
+        case .unknown: "gauge.with.dots.needle.33percent"
+        }
+    }
+
+    private var providerTint: Color {
+        switch account.provider {
+        case .claude: .orange
+        case .codex: .blue
+        case .unknown: .secondary
         }
     }
 }

@@ -16,6 +16,8 @@ describe("parseAccount", () => {
   test("accepts a well-formed push and normalises timestamps", () => {
     const account = parseAccount(valid);
     expect(account.id).toBe("rp-team");
+    expect(account.provider).toBe("claude");
+    expect(account.windows.map((window) => window.label)).toEqual(["5h"]);
     expect(account.five_hour?.utilization).toBe(0.42);
     expect(account.seven_day).toBeNull();
     // Fractional seconds preserved through normalisation.
@@ -44,6 +46,42 @@ describe("parseAccount", () => {
 
   test("rejects unparseable timestamps", () => {
     expect(() => parseAccount({ ...valid, as_of: "yesterday" })).toThrow(ValidationError);
+    expect(() => parseAccount({ ...valid, as_of: "08/07/2026 21:38" })).toThrow(ValidationError);
+  });
+
+  test("accepts provider-defined Codex windows", () => {
+    const account = parseAccount({
+      id: "codex-pro",
+      label: "Codex · Pro",
+      provider: "codex",
+      source_host: "hakon-mbp",
+      as_of: "2026-08-08T00:20:00Z",
+      status: "ok",
+      windows: [
+        {
+          id: "primary-10080m",
+          label: "7d",
+          duration_minutes: 10_080,
+          utilization: 0.45,
+          resets_at: "2026-08-09T17:36:32Z",
+        },
+      ],
+    });
+
+    expect(account.provider).toBe("codex");
+    expect(account.windows[0]?.duration_minutes).toBe(10_080);
+    expect(account.seven_day?.utilization).toBe(0.45);
+  });
+
+  test("rejects duplicate provider window ids", () => {
+    const window = {
+      id: "weekly",
+      label: "7d",
+      duration_minutes: 10_080,
+      utilization: 0.45,
+      resets_at: null,
+    };
+    expect(() => parseAccount({ ...valid, windows: [window, window] })).toThrow(/unique/);
   });
 
   test("rejects oversized labels", () => {

@@ -1,4 +1,4 @@
-# Coolify service (compose resource) for cx43.
+# Coolify service template for the eventual permanent host.
 #
 # Topology notes specific to this box:
 #   * No published ports and no Traefik. Exposure is a cloudflared sidecar,

@@ -15,5 +15,9 @@ aggregator/node_modules/
 aggregator/.data/
 aggregator/.env
 
+# Python collector
+__pycache__/
+*.py[cod]
+
 # macOS
 .DS_Store

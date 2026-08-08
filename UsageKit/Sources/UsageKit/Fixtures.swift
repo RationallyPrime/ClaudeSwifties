@@ -1,8 +1,7 @@
 import Foundation
 
 extension UsageSnapshot {
-    /// Three accounts, three edges, three states: a healthy one, one whose edge
-    /// has gone quiet, and one whose token needs re-auth by its owning client.
+    /// Claude and Codex together, including a stale edge and a sign-in state.
     public static func sample(now: Date) -> UsageSnapshot {
         UsageSnapshot(
             generatedAt: now,
@@ -17,13 +16,21 @@ extension UsageSnapshot {
                     sevenDay: UsageWindow(utilization: 0.71, resetsAt: now.addingTimeInterval(31 * 3600))
                 ),
                 AccountUsage(
-                    id: "rp-max-20x",
-                    label: "Max 20x · rationallyprime",
-                    sourceHost: "linux-laptop",
-                    asOf: now.addingTimeInterval(-96 * 60),
+                    id: "codex-pro",
+                    label: "Codex · Pro",
+                    provider: .codex,
+                    sourceHost: "hakon-mbp",
+                    asOf: now.addingTimeInterval(-6 * 60),
                     status: .ok,
-                    fiveHour: UsageWindow(utilization: 0.18, resetsAt: now.addingTimeInterval(12 * 60)),
-                    sevenDay: UsageWindow(utilization: 0.55, resetsAt: now.addingTimeInterval(50 * 3600))
+                    windows: [
+                        UsageWindow(
+                            id: "weekly",
+                            label: "7d",
+                            durationMinutes: 10_080,
+                            utilization: 0.45,
+                            resetsAt: now.addingTimeInterval(41 * 3600)
+                        ),
+                    ]
                 ),
                 AccountUsage(
                     id: "rp-team",
