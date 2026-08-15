@@ -324,6 +324,64 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("Claude stale hint keeps its window-continuity binding across a quota reset", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      pool_label: "Claude · Pool A",
+      windows: windows(0.6, "2026-08-15T18:00:00Z"),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-b",
+      provider_subject: SUBJECT_B,
+      sequence: 1,
+      pool_label: "Claude · Pool B",
+      windows: windows(0.9, "2026-08-15T19:00:00Z"),
+    }), "2026-08-15T15:30:02Z");
+
+    // Exact continuity first proves that this session's stale A hint is
+    // actually observing B.
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      pool_label: "must-not-relabel-A",
+      windows: windows(0.92, "2026-08-15T19:00:00Z"),
+    }), "2026-08-15T15:31:02Z");
+
+    // The next B generation has a new reset tuple, so it cannot be
+    // rediscovered by exact-tuple matching. The existing continuity binding
+    // must carry it across the reset instead of overwriting A.
+    const result = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T19:01:00Z",
+      observed_at: "2026-08-15T19:01:01Z",
+      pool_label: "still-must-not-relabel-A",
+      windows: windows(0.03, "2026-08-16T00:00:00Z"),
+    }), "2026-08-15T19:01:02Z");
+
+    expect(result.outcome).toBe("conflict");
+    const snapshot = store.snapshot("2026-08-15T19:02:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    const poolB = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B));
+    expect(poolA?.label).toBe("Claude · Pool A");
+    expect(poolA?.windows[0]?.utilization).toBe(0.6);
+    expect(poolA?.windows[0]?.resets_at).toBe("2026-08-15T18:00:00.000Z");
+    expect(poolB?.label).toBe("Claude · Pool B");
+    expect(poolB?.windows[0]?.utilization).toBe(0.03);
+    expect(poolB?.windows[0]?.resets_at).toBe("2026-08-16T00:00:00.000Z");
+    expect(poolB?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("window_continuity");
+    expect(store.conflictCount()).toBe(2);
+    store.close();
+  });
+
   test("first subject evidence promotes the same session's exact-continuity provisional pool", async () => {
     const { store } = await freshStore();
     store.ingest(observation({
@@ -714,6 +772,37 @@ describe("UsageStore schema-3 reconciliation", () => {
     expect(snapshot.pools.flatMap((pool) => pool.profiles.map((profile) => profile.id)).sort())
       .toEqual(["legacy-team-a", "legacy-team-b"]);
     await expect(readFile(legacyPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    store.close();
+  });
+
+  test("legacy import preserves profile IDs that begin with schema-2 punctuation", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-v3-legacy-punctuation-"));
+    const legacyAccount = (id: string, utilization: number) => ({
+      account: {
+        id,
+        label: `Claude · ${id}`,
+        provider: "claude",
+        source_host: "old-edge",
+        as_of: "2026-08-15T15:00:00Z",
+        status: "ok",
+        windows: windows(utilization),
+      },
+    });
+    await writeFile(
+      join(dir, "usage.json"),
+      JSON.stringify([
+        legacyAccount(".dot-profile", 0.2),
+        legacyAccount("_underscore-profile", 0.3),
+        legacyAccount("-dash-profile", 0.4),
+      ]),
+      "utf8",
+    );
+
+    const store = await openStore(dir);
+    expect(store.snapshot("2026-08-15T15:01:00Z").pools
+      .flatMap((pool) => pool.profiles.map((profile) => profile.id))
+      .sort())
+      .toEqual(["-dash-profile", ".dot-profile", "_underscore-profile"]);
     store.close();
   });
 

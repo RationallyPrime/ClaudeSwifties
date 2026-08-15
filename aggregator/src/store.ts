@@ -486,6 +486,7 @@ export class UsageStore {
     let pool: PoolRow | null = hintedPool;
     let confidence: BindingConfidence = observation.provider_subject ? "subject" : "provisional";
     let forcedConflict = false;
+    let carriedContinuityBinding = false;
 
     if (!pool && !observation.provider_subject && existingBinding?.provider === observation.provider) {
       pool = this.poolById(existingBinding.pool_id);
@@ -531,6 +532,39 @@ export class UsageStore {
       }
     }
 
+    // Once a Claude session has been bound away from a contradictory subject
+    // hint by exact window continuity, that session binding remains the safer
+    // identity signal across the next legitimate quota reset. A reset changes
+    // the tuple, so rediscovery cannot find the old pool; falling back to the
+    // stale hint would overwrite the wrong subject with the bound pool's new
+    // generation. Keep the bound pool authoritative and let `assess` either
+    // accept the reset there or retain it as a conflict without mutating the
+    // hinted pool.
+    if (
+      hintedPool &&
+      observation.provider === "claude" &&
+      existingBinding?.provider === "claude" &&
+      existingBinding.binding_confidence === "window_continuity" &&
+      existingBinding.pool_id !== hintedPool.id
+    ) {
+      const boundPool = this.poolById(existingBinding.pool_id);
+      if (boundPool) {
+        pool = boundPool;
+        confidence = "window_continuity";
+        carriedContinuityBinding = true;
+        forcedConflict = true;
+        this.markPoolConflict(hintedPool.id);
+        this.recordConflict(
+          observation,
+          "identity_hint_conflict",
+          hintedPool.id,
+          boundPool.id,
+          receivedAt,
+          { reason: "existing window-continuity binding survived a reset transition" },
+        );
+      }
+    }
+
     // An unbound degraded heartbeat has no quota-pool evidence. Creating a
     // provisional pool from the observer profile would collapse the canonical
     // nouns the schema is designed to keep separate. Retain and acknowledge
@@ -554,7 +588,7 @@ export class UsageStore {
     // Anthropic #81231 falsifier: auth can claim A while live rate-limit
     // windows are a continuation of B. An exact B continuity match is stronger
     // than a contradictory Claude identity hint and must never overwrite A.
-    if (hintedPool && observation.provider === "claude" &&
+    if (!carriedContinuityBinding && hintedPool && observation.provider === "claude" &&
         resetTuple(parseStoredWindows(hintedPool.windows_json)) !== resetTuple(observation.windows)) {
       const matches = this.continuityMatches(observation, hintedPool.id);
       if (matches.length === 1) {
@@ -1152,6 +1186,8 @@ interface LegacyAccount {
   seven_day?: { utilization?: unknown; resets_at?: unknown } | null;
 }
 
+const LEGACY_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
 function legacyObservation(
   value: unknown,
   index: number,
@@ -1164,9 +1200,15 @@ function legacyObservation(
     throw new Error(`legacy usage entry ${index}.account must be an object`);
   }
   const account = entry.account as unknown as LegacyAccount;
+  const legacyProfileId = account.id;
+  if (typeof legacyProfileId !== "string" || !LEGACY_ID_PATTERN.test(legacyProfileId)) {
+    throw new Error(
+      `legacy usage entry ${index}.account.id must contain 1..64 letters, numbers, dot, underscore, or dash`,
+    );
+  }
   let provider: UsageProvider;
   if (account.provider === undefined) {
-    provider = account.id?.toLowerCase().startsWith("codex") ? "codex" : "claude";
+    provider = legacyProfileId.toLowerCase().startsWith("codex") ? "codex" : "claude";
   } else if (
     account.provider === "claude" ||
     account.provider === "codex" ||
@@ -1200,13 +1242,16 @@ function legacyObservation(
       });
     }
   }
-  const observation = parseObservation({
+  const parsed = parseObservation({
     schema: 3,
     observation_id: randomUUID(),
     sequence: index,
     provider,
     edge_id: "legacy-import",
-    profile_id: account.id,
+    // Schema 2 allowed punctuation in the first position. Validate that old
+    // grammar above, parse every other field through the strict schema-3
+    // contract with a safe placeholder, then restore the exact legacy id.
+    profile_id: "legacy-import-profile",
     profile_label: account.label,
     pool_label: account.label,
     session_id: null,
@@ -1221,6 +1266,10 @@ function legacyObservation(
     identity_evidence: "unknown",
     windows,
   });
+  const observation: UsageObservation = {
+    ...parsed,
+    profile_id: legacyProfileId,
+  };
   const receivedAt = entry.received_at === undefined
     ? observation.observed_at
     : parseTimestamp(entry.received_at, `legacy usage entry ${index}.received_at`);

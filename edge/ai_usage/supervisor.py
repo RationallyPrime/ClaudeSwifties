@@ -181,6 +181,33 @@ class Supervisor:
     def _save_runtime(self, state: RuntimeState) -> None:
         atomic_write_json(self.runtime_path, state.to_dict(), mode=0o600)
 
+    def _load_last_sample(self) -> Observation | None:
+        """Treat the derived last-good cache as rebuildable, never durable truth."""
+        try:
+            return self.spool.load_last_sample()
+        except (CollectorError, OSError) as error:
+            self.diagnostics.write(
+                "last_sample_invalid", error=type(error).__name__
+            )
+            try:
+                self.config.last_sample_path.unlink(missing_ok=True)
+            except OSError as unlink_error:
+                self.diagnostics.write(
+                    "last_sample_discard_failed",
+                    error=type(unlink_error).__name__,
+                )
+            return None
+
+    def _save_last_sample(self, observation: Observation) -> None:
+        try:
+            self.spool.save_last_sample(observation)
+        except (CollectorError, OSError) as error:
+            # This cache accelerates degraded readings but is never allowed to
+            # block durable spool delivery.
+            self.diagnostics.write(
+                "last_sample_save_failed", error=type(error).__name__
+            )
+
     def _poll_identity(
         self, state: RuntimeState, now: float
     ) -> tuple[IdentityHint, str]:
@@ -242,7 +269,7 @@ class Supervisor:
         windows = reading.windows
         pool_label = reading.pool_label
         if not windows:
-            last = self.spool.load_last_sample()
+            last = self._load_last_sample()
             if last is not None and self._identity_compatible(last, reading.identity):
                 sampled_at = parse_timestamp(last.sampled_at, "last sample sampled_at")
                 sample_quality = last.sample_time_quality
@@ -267,7 +294,7 @@ class Supervisor:
                 "spool_full", observation_id=observation.observation_id
             )
             return None
-        self.spool.save_last_sample(observation)
+        self._save_last_sample(observation)
         state.last_emit_at = now
         return observation
 
@@ -288,7 +315,7 @@ class Supervisor:
     ) -> Observation | None:
         if now - state.last_emit_at < self.config.heartbeat_seconds:
             return None
-        last = self.spool.load_last_sample()
+        last = self._load_last_sample()
         if last is not None and not self._identity_compatible(last, identity):
             last = None
         observed = utc_now()
@@ -350,9 +377,9 @@ class Supervisor:
             latest = pending.observation
         if latest is None:
             return
-        current = self.spool.load_last_sample()
+        current = self._load_last_sample()
         if current is None or latest.sequence > current.sequence:
-            self.spool.save_last_sample(latest)
+            self._save_last_sample(latest)
         emitted_at = parse_timestamp(
             latest.observed_at, "queued observation observed_at"
         ).timestamp()

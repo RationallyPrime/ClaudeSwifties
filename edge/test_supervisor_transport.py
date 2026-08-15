@@ -380,6 +380,31 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(Spool(config).stats()["pending"], 0)
             self.assertEqual(transport.sent[0].observation_id, queued.observation_id)
 
+    def test_corrupt_last_sample_is_rebuilt_without_blocking_spool_drain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), "codex")
+            queued = observation(config)
+            spool = Spool(config)
+            spool.enqueue(queued)
+            config.last_sample_path.parent.mkdir(parents=True, exist_ok=True)
+            config.last_sample_path.write_text("{not-json", encoding="utf-8")
+            transport = RecordingTransport()
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+
+            with mock.patch(
+                "ai_usage.supervisor.collect_provider",
+                side_effect=CollectorError("provider sample is unavailable"),
+            ):
+                result = supervisor.run()
+
+            self.assertEqual(result["queued"], 0)
+            self.assertEqual(result["delivered"], 1)
+            self.assertEqual(spool.stats()["pending"], 0)
+            self.assertEqual(transport.sent[0].observation_id, queued.observation_id)
+            rebuilt = spool.load_last_sample()
+            self.assertEqual(rebuilt.observation_id, queued.observation_id)
+            self.assertIn("last_sample_invalid", config.diagnostics_path.read_text())
+
     def test_full_spool_skips_new_sample_but_still_drains(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary), "codex", spool_max_count=8)
