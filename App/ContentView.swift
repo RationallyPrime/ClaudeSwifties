@@ -446,8 +446,9 @@ struct ContentView: View {
         validationMessage = nil
 
         guard let url = validatedEndpoint() else { return }
-        guard token.count >= 16 else {
-            validationMessage = "The read token must be at least 16 characters."
+        guard UsageReadTokenPolicy().allows(token) else {
+            validationMessage =
+                "The read token must contain 16–512 ASCII characters without spaces."
             return
         }
 

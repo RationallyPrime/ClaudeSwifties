@@ -84,6 +84,11 @@ class ContractTests(unittest.TestCase):
         value["profile_label"] = "🚀" * 65
         with self.assertRaises(CollectorError):
             Observation.from_dict(value)
+
+    def test_provider_display_sanitizes_lone_surrogates(self):
+        from ai_usage.util import display_text
+
+        self.assertEqual(display_text("Build\ud800Plan", "fallback"), "Build\ufffdPlan")
         value = self.observation().to_dict()
         value["source_host"] = "host\nforged-log-line"
         with self.assertRaises(CollectorError):

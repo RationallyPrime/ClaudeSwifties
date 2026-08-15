@@ -8,10 +8,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ai_usage.installer import _systemd_quote
+
 EDGE_DIR = Path(__file__).resolve().parent
 
 
 class InstallerTests(unittest.TestCase):
+    def test_systemd_arguments_escape_literal_percent_specifiers(self):
+        self.assertEqual(
+            _systemd_quote("/tmp/100%/collector"), '"/tmp/100%%/collector"'
+        )
+
     def environment(self, root: Path, provider: str, profile_id: str):
         profile = root / "profiles" / profile_id
         environment = {

@@ -545,11 +545,18 @@ export class UsageStore {
       observation.provider === "claude" &&
       existingBinding?.provider === "claude" &&
       existingBinding.binding_confidence === "window_continuity" &&
-      existingBinding.pool_id !== hintedPool.id &&
-      !this.followsExactContinuity(hintedPool, observation)
+      existingBinding.pool_id !== hintedPool.id
     ) {
       const boundPool = this.poolById(existingBinding.pool_id);
-      if (boundPool) {
+      const hintedStillMatches = this.followsExactContinuity(hintedPool, observation);
+      const boundStillMatches = boundPool
+        ? this.followsExactContinuity(boundPool, observation)
+        : false;
+      // Yield to the subject hint only when its windows corroborate the hint
+      // and no longer corroborate the established continuity binding. If both
+      // pools happen to match, the new evidence is ambiguous rather than a
+      // proven identity realignment.
+      if (boundPool && (!hintedStillMatches || boundStillMatches)) {
         pool = boundPool;
         confidence = "window_continuity";
         carriedContinuityBinding = true;

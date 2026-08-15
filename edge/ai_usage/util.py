@@ -15,6 +15,7 @@ from .errors import CollectorError
 UTC = dt.timezone.utc
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+")
 TOKENISH_RE = re.compile(r"(?i)(token|secret|identity[_ -]?key)(\s*[:=]\s*)[^\s,;}]+")
 
@@ -71,14 +72,19 @@ def validate_display(value: Any, field: str, maximum: int = 120) -> str:
     if not isinstance(value, str):
         raise CollectorError(f"{field} must be a string")
     stripped = value.strip()
-    if not stripped or utf16_length(stripped) > maximum or CONTROL_RE.search(stripped):
+    if (
+        not stripped
+        or utf16_length(stripped) > maximum
+        or CONTROL_RE.search(stripped)
+        or SURROGATE_RE.search(stripped)
+    ):
         raise CollectorError(f"{field} must be 1..{maximum} printable characters")
     return stripped
 
 
 def utf16_length(value: str) -> int:
     """Match JavaScript string-length limits used by the aggregator."""
-    return len(value.encode("utf-16-le")) // 2
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
 
 
 def truncate_utf16(value: str, maximum: int) -> str:
@@ -97,7 +103,7 @@ def display_text(value: Any, fallback: str, maximum: int = 120) -> str:
     """Return provider text safe for the strict wire/log contract."""
     if not isinstance(value, str):
         return fallback
-    cleaned = CONTROL_RE.sub(" ", value).strip()
+    cleaned = SURROGATE_RE.sub("\ufffd", CONTROL_RE.sub(" ", value)).strip()
     return truncate_utf16(cleaned, maximum) or fallback
 
 

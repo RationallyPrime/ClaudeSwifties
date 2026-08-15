@@ -19,6 +19,12 @@ from .util import atomic_write_bytes, atomic_write_json, private_directory, read
 
 SPOOL_NAME_RE = re.compile(r"(?P<sequence>[0-9]{16})-(?P<id>[0-9a-f-]{36})\.json\Z")
 MAX_OBSERVATION_BYTES = 8 * 1024
+SAMPLE_QUALITY_RANK = {
+    "unknown": 0,
+    "sensor_time": 1,
+    "transcript_mtime": 2,
+    "provider_time": 3,
+}
 
 
 class FileLock:
@@ -167,6 +173,22 @@ class Spool:
             for identifier, old_value in older_values.items()
         )
 
+    @staticmethod
+    def _sample_is_at_least_as_fresh(older: dict, newer: dict) -> bool:
+        older_at = older.get("sampled_at")
+        newer_at = newer.get("sampled_at")
+        if not isinstance(older_at, str) or not isinstance(newer_at, str):
+            return False
+        if newer_at != older_at:
+            return newer_at > older_at
+        older_rank = SAMPLE_QUALITY_RANK.get(older.get("sample_time_quality"))
+        newer_rank = SAMPLE_QUALITY_RANK.get(newer.get("sample_time_quality"))
+        return (
+            older_rank is not None
+            and newer_rank is not None
+            and newer_rank >= older_rank
+        )
+
     def _coalesce_if_needed(self, count: int, size: int) -> tuple[int, int]:
         paths = self._paths()
         newer_for_key: dict[tuple, list[dict]] = {}
@@ -180,7 +202,8 @@ class Spool:
                 continue
             key = self._coalesce_key(value)
             if any(
-                self._componentwise_monotonic(value, newer)
+                self._sample_is_at_least_as_fresh(value, newer)
+                and self._componentwise_monotonic(value, newer)
                 for newer in newer_for_key.get(key, [])
             ):
                 redundant.add(path)

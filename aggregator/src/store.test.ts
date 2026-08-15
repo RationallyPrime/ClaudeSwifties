@@ -429,6 +429,52 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("Claude keeps its established binding when both pools match the windows", async () => {
+    const { store } = await freshStore();
+    const convergedReset = "2026-08-15T20:00:00Z";
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      windows: windows(0.6, convergedReset),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-b",
+      provider_subject: SUBJECT_B,
+      sequence: 1,
+      windows: windows(0.4, convergedReset),
+    }), "2026-08-15T15:30:02Z");
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.42, convergedReset),
+    }), "2026-08-15T15:31:02Z");
+
+    // The next stale-A sample is monotonic for both same-generation pools, so
+    // it cannot prove that the bound session has left B.
+    const ambiguous = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:32:00Z",
+      observed_at: "2026-08-15T15:32:01Z",
+      windows: windows(0.62, convergedReset),
+    }), "2026-08-15T15:32:02Z");
+
+    expect(ambiguous.outcome).toBe("conflict");
+    const snapshot = store.snapshot("2026-08-15T15:33:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    const poolB = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B));
+    expect(poolA?.windows[0]?.utilization).toBe(0.6);
+    expect(poolB?.windows[0]?.utilization).toBe(0.62);
+    expect(poolB?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("window_continuity");
+    store.close();
+  });
+
   test("first subject evidence promotes the same session's exact-continuity provisional pool", async () => {
     const { store } = await freshStore();
     store.ingest(observation({

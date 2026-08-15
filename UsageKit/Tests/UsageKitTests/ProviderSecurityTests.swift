@@ -108,6 +108,17 @@ private actor RecordingTransport: UsageHTTPTransport {
     #expect(!policy.allows(try #require(URL(string: "https://usage.example/v3/usage?format=json"))))
 }
 
+@Test func readTokenPolicyMatchesAggregatorBearerGrammar() {
+    let policy = UsageReadTokenPolicy()
+
+    #expect(policy.allows(String(repeating: "a", count: 16)))
+    #expect(policy.allows(String(repeating: "~", count: 512)))
+    #expect(!policy.allows(String(repeating: "a", count: 15)))
+    #expect(!policy.allows(String(repeating: "a", count: 513)))
+    #expect(!policy.allows("valid-looking token"))
+    #expect(!policy.allows(String(repeating: "é", count: 16)))
+}
+
 @Test func sharedKeychainQuerySelectsDataProtectionSemantics() {
     let store = KeychainSecretStore(accessGroup: "TESTTEAM.is.example.shared")
     let query = store.baseQuery

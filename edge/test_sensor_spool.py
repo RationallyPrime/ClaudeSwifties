@@ -177,14 +177,16 @@ class SpoolTests(unittest.TestCase):
         subject="A" * 43,
         reset="2026-08-16T00:00:00Z",
         utilization=0.5,
+        sampled_at=None,
+        sample_time_quality="sensor_time",
     ):
         now = dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
         return make_observation(
             config,
             sequence=sequence,
             observed_at=now,
-            sampled_at=now,
-            sample_time_quality="sensor_time",
+            sampled_at=sampled_at or now,
+            sample_time_quality=sample_time_quality,
             status="ok",
             identity=IdentityHint(subject, "org_email"),
             windows=[QuotaWindow("five-hour", "5h", 300, utilization, reset)],
@@ -256,6 +258,35 @@ class SpoolTests(unittest.TestCase):
             with self.assertRaises(SpoolFull):
                 spool.enqueue(self.observation(config, 200, subject="Z" * 43))
             self.assertEqual(spool.stats()["pending"], 8)
+
+    def test_pressure_preserves_provider_fresher_sample_despite_newer_sequence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(
+                Path(temporary), spool_max_count=8, spool_max_bytes=65_536
+            )
+            spool = Spool(config)
+            fresh = dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+            stale = fresh - dt.timedelta(minutes=1)
+            spool.enqueue(
+                self.observation(config, 1, utilization=0.5, sampled_at=fresh)
+            )
+            spool.enqueue(
+                self.observation(config, 2, utilization=0.6, sampled_at=stale)
+            )
+            for sequence in range(10, 16):
+                spool.enqueue(
+                    self.observation(
+                        config,
+                        sequence,
+                        subject=chr(65 + sequence) * 43,
+                    )
+                )
+
+            spool.enqueue(
+                self.observation(config, 3, utilization=0.7, sampled_at=stale)
+            )
+            retained = [item.observation.sequence for item in spool.pending()]
+            self.assertEqual(retained, [1, 3, 10, 11, 12, 13, 14, 15])
 
 
 if __name__ == "__main__":

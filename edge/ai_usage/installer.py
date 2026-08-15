@@ -154,6 +154,12 @@ def _service_name(config: CollectorConfig) -> str:
     return f"is.sokrates.ai-usage.{config.provider}.{config.profile_id}"
 
 
+def _systemd_quote(value: str) -> str:
+    return (
+        '"' + value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"') + '"'
+    )
+
+
 def _service_install(config: CollectorConfig, install_root: Path) -> tuple[str, Path]:
     service_name = _service_name(config)
     arguments = [
@@ -204,9 +210,6 @@ def _service_install(config: CollectorConfig, install_root: Path) -> tuple[str, 
     destination = unit_root / f"{service_name}.service"
     timer = unit_root / f"{service_name}.timer"
 
-    def quote(value: str) -> str:
-        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
     service_content = "\n".join(
         [
             "[Unit]",
@@ -214,7 +217,7 @@ def _service_install(config: CollectorConfig, install_root: Path) -> tuple[str, 
             "",
             "[Service]",
             "Type=oneshot",
-            "ExecStart=" + " ".join(quote(part) for part in arguments),
+            "ExecStart=" + " ".join(_systemd_quote(part) for part in arguments),
             "StandardOutput=null",
             "StandardError=null",
             "UMask=0077",

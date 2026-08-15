@@ -35,6 +35,15 @@ public struct UsageEndpointPolicy: Sendable, Equatable {
     }
 }
 
+public struct UsageReadTokenPolicy: Sendable, Equatable {
+    public init() {}
+
+    public func allows(_ token: String) -> Bool {
+        let bytes = token.utf8
+        return (16...512).contains(bytes.count) && bytes.allSatisfy { (0x21...0x7E).contains($0) }
+    }
+}
+
 /// Origin comparison used by both the URLSession delegate and unit tests.
 /// Redirects are permitted only when both URLs are HTTPS and their normalized
 /// host/port tuple is unchanged.
