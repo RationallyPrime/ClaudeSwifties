@@ -1,7 +1,7 @@
 {
   "name": "@skrates/usage-aggregator",
-  "version": "0.1.0",
-  "description": "Last-known-good Claude and Codex usage, pushed by collectors and read by Apple widgets",
+  "version": "0.3.0",
+  "description": "Durable quota-pool observations for Claude, Codex, and Grok Build",
   "private": true,
   "type": "module",
   "scripts": {

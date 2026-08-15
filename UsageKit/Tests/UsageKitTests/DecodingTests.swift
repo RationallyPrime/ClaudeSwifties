@@ -3,123 +3,125 @@ import Testing
 
 @testable import UsageKit
 
-/// Mirrors the contract exactly as the aggregator will serve it, including the
-/// mixed fractional/plain timestamps the three edges will disagree about.
-private let contractJSON = """
+private let schema3JSON = """
 {
-  "schema": 1,
-  "generated_at": "2026-08-07T21:40:00Z",
-  "accounts": [
+  "schema": 3,
+  "generated_at": "2026-08-15T16:00:00Z",
+  "pools": [
     {
-      "id": "sokrates-team",
-      "label": "Sokrates · Team",
-      "source_host": "timaeus-mbp",
-      "as_of": "2026-08-07T21:38:12.482Z",
+      "id": "claude-opaque",
+      "provider": "claude",
+      "label": "Claude · Max 20x",
+      "identity_state": "verified",
       "status": "ok",
-      "five_hour": { "utilization": 0.42, "resets_at": "2026-08-07T23:10:00Z" },
-      "seven_day": { "utilization": 0.71, "resets_at": "2026-08-09T04:00:00Z" }
+      "sampled_at": "2026-08-15T15:57:00.125Z",
+      "received_at": "2026-08-15T15:57:03Z",
+      "windows": [
+        {
+          "id": "five-hour",
+          "label": "5h",
+          "duration_minutes": 300,
+          "utilization": 0.58,
+          "resets_at": "2026-08-15T18:00:00Z"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "desktop-a",
+          "label": "Desktop A",
+          "source_host": "linux-host",
+          "last_seen_at": "2026-08-15T15:58:00Z",
+          "state": "current",
+          "binding_confidence": "subject"
+        },
+        {
+          "id": "edge-profile-b",
+          "label": "Edge profile B",
+          "source_host": "edge-host",
+          "last_seen_at": "2026-08-15T15:57:30Z",
+          "state": "current",
+          "binding_confidence": "window_continuity"
+        }
+      ]
     },
     {
-      "id": "rp-team",
-      "label": "Team · rationallyprime",
-      "source_host": "hetzner-cx53",
-      "as_of": "2026-08-07T21:32:00Z",
-      "status": "auth_expired",
-      "five_hour": null,
-      "seven_day": null
+      "id": "grok-opaque",
+      "provider": "grok",
+      "label": "Grok Build · SuperGrok",
+      "identity_state": "conflict",
+      "status": "billing_unavailable",
+      "sampled_at": "2026-08-15T15:00:00Z",
+      "received_at": "2026-08-15T15:00:05Z",
+      "windows": [],
+      "profiles": []
     }
   ]
 }
 """
 
-@Test func decodesTheContract() throws {
+@Test func decodesSchema3PoolsAndSharedProfiles() throws {
     let snapshot = try JSONDecoder.usageDecoder()
-        .decode(UsageSnapshot.self, from: Data(contractJSON.utf8))
+        .decode(UsageSnapshot.self, from: Data(schema3JSON.utf8))
 
-    #expect(snapshot.schema == 1)
-    #expect(snapshot.accounts.count == 2)
+    #expect(snapshot.schema == 3)
+    #expect(snapshot.pools.map(\.id) == ["claude-opaque", "grok-opaque"])
 
-    let first = snapshot.accounts[0]
-    #expect(first.id == "sokrates-team")
-    #expect(first.provider == .claude)
-    #expect(first.sourceHost == "timaeus-mbp")
-    #expect(first.status == .ok)
-    #expect(first.fiveHour?.fraction == 0.42)
+    let claude = try #require(snapshot.pools.first)
+    #expect(claude.identityState == .verified)
+    #expect(claude.windows.first?.fraction == 0.58)
+    #expect(
+        claude.currentProfiles(now: snapshot.generatedAt).map(\.label)
+            == ["Desktop A", "Edge profile B"]
+    )
+    #expect(claude.profiles[1].bindingConfidence == .windowContinuity)
 
-    let second = snapshot.accounts[1]
-    #expect(second.status == .authExpired)
-    #expect(second.fiveHour == nil)
+    let grok = snapshot.pools[1]
+    #expect(grok.provider == .grok)
+    #expect(grok.identityState == .conflict)
+    #expect(grok.status == .billingUnavailable)
 }
 
-@Test func decodesProviderDefinedCodexWindows() throws {
-    let json = """
-    {
-      "schema": 2,
-      "generated_at": "2026-08-08T00:20:00Z",
-      "accounts": [{
-        "id": "codex-pro",
-        "label": "Codex · Pro",
-        "provider": "codex",
-        "source_host": "hakon-mbp",
-        "as_of": "2026-08-08T00:19:50Z",
-        "status": "ok",
-        "windows": [{
-          "id": "primary-10080m",
-          "label": "7d",
-          "duration_minutes": 10080,
-          "utilization": 0.45,
-          "resets_at": "2026-08-09T17:36:32Z"
-        }],
-        "five_hour": null,
-        "seven_day": {
-          "utilization": 0.45,
-          "resets_at": "2026-08-09T17:36:32Z"
-        }
-      }]
+@Test func acceptsFractionalAndPlainTimestamps() throws {
+    let snapshot = try JSONDecoder.usageDecoder()
+        .decode(UsageSnapshot.self, from: Data(schema3JSON.utf8))
+    let pool = try #require(snapshot.pools.first)
+
+    #expect(abs(pool.receivedAt.timeIntervalSince(pool.sampledAt) - 2.875) < 0.001)
+}
+
+@Test func unknownEnumValuesDegradeOnePoolWithoutBlankingSnapshot() throws {
+    let unknown = schema3JSON
+        .replacingOccurrences(of: "\"verified\"", with: "\"future_identity\"")
+        .replacingOccurrences(of: "\"subject\"", with: "\"future_binding\"")
+    let snapshot = try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: Data(unknown.utf8))
+
+    #expect(snapshot.pools[0].identityState == .unknown)
+    #expect(snapshot.pools[0].profiles[0].bindingConfidence == .unknown)
+    #expect(snapshot.pools[1].provider == .grok)
+}
+
+@Test func rejectsNonSchema3Projection() {
+    let legacy = schema3JSON.replacingOccurrences(of: "\"schema\": 3", with: "\"schema\": 2")
+    #expect(throws: DecodingError.self) {
+        try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: Data(legacy.utf8))
     }
-    """
-
-    let snapshot = try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: Data(json.utf8))
-    let account = try #require(snapshot.accounts.first)
-
-    #expect(snapshot.schema == 2)
-    #expect(account.provider == .codex)
-    #expect(account.windows.count == 1)
-    #expect(account.windows[0].label == "7d")
-    #expect(account.windows[0].durationMinutes == 10_080)
-    #expect(account.windows[0].fraction == 0.45)
-}
-
-@Test func acceptsBothTimestampShapes() throws {
-    let snapshot = try JSONDecoder.usageDecoder()
-        .decode(UsageSnapshot.self, from: Data(contractJSON.utf8))
-
-    // 21:38:12.482Z (fractional) and 21:32:00Z (plain) — six minutes apart.
-    let gap = snapshot.accounts[0].asOf.timeIntervalSince(snapshot.accounts[1].asOf)
-    #expect(abs(gap - 372.482) < 0.01)
-}
-
-/// A new status value shipped by the aggregator must degrade one tile, never
-/// blank the widget.
-@Test func unknownStatusDoesNotThrow() throws {
-    let json = contractJSON.replacingOccurrences(of: "\"auth_expired\"", with: "\"quota_hold\"")
-    let snapshot = try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: Data(json.utf8))
-
-    #expect(snapshot.accounts[1].status == .unknown)
-    #expect(snapshot.accounts[0].status == .ok)
 }
 
 @Test func utilizationIsClampedForDisplay() {
-    #expect(UsageWindow(utilization: 1.4, resetsAt: .now).fraction == 1.0)
-    #expect(UsageWindow(utilization: -0.2, resetsAt: .now).fraction == 0.0)
+    #expect(
+        UsageWindow(id: "a", label: "A", utilization: 1.4, resetsAt: .now).fraction == 1.0
+    )
+    #expect(
+        UsageWindow(id: "a", label: "A", utilization: -0.2, resetsAt: .now).fraction == 0.0
+    )
 }
 
-@Test func roundTripsThroughEncoder() throws {
+@Test func roundTripsSchema3WithoutChangingServerOrder() throws {
     let original = UsageSnapshot.sample(now: Date(timeIntervalSince1970: 1_786_100_000))
     let data = try JSONEncoder.usageEncoder().encode(original)
     let restored = try JSONDecoder.usageDecoder().decode(UsageSnapshot.self, from: data)
 
-    #expect(restored.accounts.map(\.id) == original.accounts.map(\.id))
-    #expect(restored.accounts[1].provider == .codex)
-    #expect(restored.accounts[2].status == .authExpired)
+    #expect(restored == original)
+    #expect(restored.pools.map(\.id) == original.pools.map(\.id))
+    #expect(restored.pools.last?.provider == .grok)
 }

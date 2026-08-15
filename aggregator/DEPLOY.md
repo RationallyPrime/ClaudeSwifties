@@ -1,111 +1,90 @@
-# Deploying usage-aggregator
+# Deploying usage-aggregator schema 3
 
-## Current temporary host
+This public document intentionally contains no live hostname, IP address,
+login, endpoint, private-network name, filesystem path, or container name.
+Keep those coordinates in the private operations corpus.
 
-The live container is on `agent-cx53`, reachable to operators at
-`root@167.233.120.83`. Despite the old cx43 notes, this machine is **not** the
-Coolify host: it has no `/data/coolify` tree.
+## Topology and trust boundaries
 
-Current topology:
+Run the aggregator as an unprivileged container with a persistent volume at
+`/data`. Expose the read surface through HTTPS. Prefer routing ingest only over
+a private listener/network when the deployment platform can split the surfaces
+cleanly.
 
-- Source staging: `/opt/usage/aggregator`
-- Secret environment file: `/opt/usage/.env`
-- Container: `usage-aggregator`
-- Image: a locally built `usage-aggregator:<tag>`
-- Bind: `127.0.0.1:8080 → 8080`
-- Persistent volume: `usage-data:/data`
-- Public HTTPS: Tailscale Funnel at
-  `https://agent-cx53.tail1f9f2e.ts.net`
+The public liveness probe is `GET /health`. Readiness is not public:
+`GET /ready` requires the read bearer and proves that a SQLite write transaction
+can commit. An authenticated `GET /doctor` adds the conflict count without
+returning observations or provider metadata.
 
-The client read URL is
-`https://agent-cx53.tail1f9f2e.ts.net/v1/usage`. It is public-reachable but
-still requires the read bearer; unauthenticated reads must return 401.
+Required secrets/configuration:
 
-The container runs as the image's unprivileged `bun` user. An existing volume
-created by the older root-running image needs a one-time ownership correction
-before the swap; root can still read it for rollback.
+- `READ_TOKEN`: app/widget bearer;
+- `EDGE_CREDENTIALS_JSON`: token SHA-256 → edge/profile allow-list map;
+- proxy/tunnel credentials, when the chosen HTTPS ingress requires them.
 
-Never print `.env`, `docker inspect ... .Config.Env`, or bearer headers.
-Printing key names for a structural check is sufficient.
+Never print environment values, Authorization headers, container environment,
+or raw collector configuration during structural checks.
 
 ## Build and test a candidate
 
-Stage source without copying local secrets or dependencies:
+Build from the repository root or `aggregator/` according to the deployment
+system, pinning the image to the exact Git commit rather than `latest`.
 
-```bash
-rsync -az --delete \
-  --exclude node_modules --exclude .data --exclude .env --exclude '._*' \
-  aggregator/ root@167.233.120.83:/opt/usage/aggregator-candidate/
+```sh
+cd aggregator
+bun install --frozen-lockfile
+bun test
+bun run check
+docker build -t usage-aggregator:<commit> .
 ```
 
-Build with a unique tag, ideally the Git commit:
+Run the candidate on a separate private port and a temporary persistent volume.
+Pass secrets through the platform secret mechanism or an environment file that
+is never sourced, echoed, or committed.
 
-```bash
-ssh root@167.233.120.83 \
-  'docker build -t usage-aggregator:<commit> /opt/usage/aggregator-candidate'
-```
+Verify all of the following, not merely container health:
 
-Run the candidate on a separate loopback port and a temporary volume. Pass the
-existing env file directly to Docker; do not source or echo it:
+- `/health` is 200 without credentials;
+- `/ready` is 401 without credentials and 200 with the read bearer;
+- unauthenticated `/v3/usage` is 401;
+- an edge bearer cannot read and the read bearer cannot ingest;
+- one edge bearer cannot claim another edge/profile;
+- a valid observation receives a matching-ID 2xx ACK and appears in the next
+  authenticated schema-3 snapshot;
+- `/doctor` is authenticated and reports readiness plus conflict count;
+- the database, WAL, and shared-memory files are private to the service user.
 
-```bash
-ssh root@167.233.120.83 \
-  'docker run -d --name usage-aggregator-candidate --rm \
-   --env-file /opt/usage/.env -e DATA_DIR=/data \
-   -p 127.0.0.1:8081:8080 -v usage-candidate-data:/data \
-   usage-aggregator:<commit>'
-```
+## One-time schema-2 cutover
 
-Verify `/health`, reject an unauthenticated `/v1/usage` request, and perform
-an authenticated read using the secret only inside the remote shell. A green
-health check alone proves nothing about the bearer path.
+Do not replace the live schema-2 service in place before testing the schema-3
+candidate.
 
-## Recoverable production swap
+1. Back up the persistent volume using the private operations procedure.
+2. Copy `usage.json` into the candidate volume without printing it.
+3. Start the candidate with `REQUIRE_LEGACY_IMPORT=true`.
+4. Confirm startup imported provisional pools, committed the migration marker,
+   and removed `usage.json`.
+5. Install one schema-3 canary edge and prove duplicate/retry delivery.
+6. Update the app/widget and remaining edges.
+7. Exercise real pool switches and shared-pool bindings.
+8. Retire schema 2 only after the terminal KRA-1096 live proof succeeds.
 
-Keep the previous container stopped under a rollback name:
+There is no dual-format endpoint and no permanent schema-2 importer. If the
+legacy input is missing or corrupt in required-import mode, startup must remain
+failed until the operator restores the intended input or explicitly chooses a
+fresh-install deployment.
 
-```bash
-docker run --rm --user root -v usage-data:/data \
-  --entrypoint sh oven/bun:1.3.14-alpine -c 'chown -R bun:bun /data'
-docker stop usage-aggregator
-docker rename usage-aggregator usage-aggregator-previous
-docker run -d --name usage-aggregator --restart unless-stopped \
-  --env-file /opt/usage/.env \
-  -p 127.0.0.1:8080:8080 \
-  -v usage-data:/data \
-  usage-aggregator:<commit>
-```
+## Credential rotation
 
-Verify container health, authenticated schema, and public behavior before
-removing the previous container. Rollback is the reverse: stop and rename the
-new container, restore the previous name, then start it.
+After all edges use their per-edge tokens:
 
-## Public HTTPS
+1. retire the old fleet-wide ingest bearer;
+2. verify the retired bearer fails both read and ingest;
+3. rotate the read bearer after every signed client has migrated it to
+   Keychain;
+4. verify the old read bearer fails;
+5. inspect bounded logs, process listings, preferences, repository artifacts,
+   and crash output for accidental bearer exposure.
 
-Tailnet-only Serve:
-
-```bash
-tailscale serve --bg --yes 8080
-```
-
-Public Funnel:
-
-```bash
-tailscale funnel --bg --yes 8080
-```
-
-After enabling Funnel, verify from a machine outside the host:
-
-- `GET /health` returns 200.
-- `GET /v1/usage` without a bearer returns 401.
-- The read bearer returns schema 2.
-- The ingest bearer is rejected on `/v1/usage`.
-- A collector push appears in the next authenticated snapshot.
-
-## Future Coolify move
-
-The compose file remains suitable for a Coolify service with a cloudflared
-sidecar, but the actual Coolify host must be rediscovered first. Do not use
-`167.233.120.83` as if it were that box. Any eventual Coolify compose edit is a
-dual write to the service's database copy and rendered file, followed by public
-URL verification.
+Roll back by restoring the prior immutable image and its backed-up volume. Do
+not point a schema-2 process at a schema-3 SQLite volume.

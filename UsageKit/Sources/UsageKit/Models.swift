@@ -1,22 +1,43 @@
 import Foundation
 
-/// The payload served by the aggregator. Schema 2 adds provider identity and
-/// provider-defined windows while retaining decoding support for schema 1.
+/// The schema-3 read projection served by the aggregator. Pool order is part
+/// of the server contract: clients preserve it instead of sorting opaque IDs.
 public struct UsageSnapshot: Codable, Sendable, Equatable {
     public let schema: Int
     public let generatedAt: Date
-    public let accounts: [AccountUsage]
+    public let pools: [UsagePool]
 
-    public init(schema: Int = 2, generatedAt: Date, accounts: [AccountUsage]) {
+    public init(schema: Int = 3, generatedAt: Date, pools: [UsagePool]) {
         self.schema = schema
         self.generatedAt = generatedAt
-        self.accounts = accounts
+        self.pools = pools
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schema
+        case generatedAt
+        case pools
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decode(Int.self, forKey: .schema)
+        guard schema == 3 else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .schema,
+                in: container,
+                debugDescription: "Unsupported usage schema \(schema); expected schema 3."
+            )
+        }
+        generatedAt = try container.decode(Date.self, forKey: .generatedAt)
+        pools = try container.decode([UsagePool].self, forKey: .pools)
     }
 }
 
 public enum UsageProviderKind: String, Codable, Sendable, Equatable {
     case claude
     case codex
+    case grok
     case unknown
 
     public init(from decoder: any Decoder) throws {
@@ -25,131 +46,123 @@ public enum UsageProviderKind: String, Codable, Sendable, Equatable {
     }
 }
 
-/// One subscription's state, as last reported by the edge that owns its
-/// authenticated client. `asOf` is the edge's reading time, not the
-/// aggregator's serve time.
-public struct AccountUsage: Codable, Sendable, Equatable, Identifiable {
-    public let id: String
-    public let label: String
-    public let provider: UsageProviderKind
-    public let sourceHost: String
-    public let asOf: Date
-    public let status: AccountStatus
-    public let windows: [UsageWindow]
-
-    public init(
-        id: String,
-        label: String,
-        provider: UsageProviderKind = .claude,
-        sourceHost: String,
-        asOf: Date,
-        status: AccountStatus,
-        windows: [UsageWindow]
-    ) {
-        self.id = id
-        self.label = label
-        self.provider = provider
-        self.sourceHost = sourceHost
-        self.asOf = asOf
-        self.status = status
-        self.windows = windows
-    }
-
-    /// Compatibility initializer for the original Claude-only contract.
-    public init(
-        id: String,
-        label: String,
-        provider: UsageProviderKind = .claude,
-        sourceHost: String,
-        asOf: Date,
-        status: AccountStatus,
-        fiveHour: UsageWindow?,
-        sevenDay: UsageWindow?
-    ) {
-        self.init(
-            id: id,
-            label: label,
-            provider: provider,
-            sourceHost: sourceHost,
-            asOf: asOf,
-            status: status,
-            windows: [
-                fiveHour?.withMetadata(id: "five-hour", label: "5h", durationMinutes: 300),
-                sevenDay?.withMetadata(id: "seven-day", label: "7d", durationMinutes: 10_080),
-            ].compactMap(\.self)
-        )
-    }
-
-    public var fiveHour: UsageWindow? {
-        windows.first { $0.durationMinutes == 300 || $0.id == "five-hour" }
-    }
-
-    public var sevenDay: UsageWindow? {
-        windows.first { $0.durationMinutes == 10_080 || $0.id == "seven-day" }
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id
-        case label
-        case provider
-        case sourceHost
-        case asOf
-        case status
-        case windows
-        case fiveHour
-        case sevenDay
-    }
+/// Whether the aggregator could reconcile provider identity evidence with the
+/// observed quota windows. A conflict is evidence to show, never permission
+/// for the client to rename or merge pools.
+public enum PoolIdentityState: String, Codable, Sendable, Equatable {
+    case verified
+    case provisional
+    case conflict
+    case unknown
 
     public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
-        label = try container.decode(String.self, forKey: .label)
-        provider = try container.decodeIfPresent(UsageProviderKind.self, forKey: .provider) ??
-            (id.lowercased().hasPrefix("codex") ? .codex : .claude)
-        sourceHost = try container.decode(String.self, forKey: .sourceHost)
-        asOf = try container.decode(Date.self, forKey: .asOf)
-        status = try container.decode(AccountStatus.self, forKey: .status)
-
-        if let decoded = try container.decodeIfPresent([UsageWindow].self, forKey: .windows) {
-            windows = decoded
-        } else {
-            let fiveHour = try container.decodeIfPresent(UsageWindow.self, forKey: .fiveHour)
-            let sevenDay = try container.decodeIfPresent(UsageWindow.self, forKey: .sevenDay)
-            windows = [
-                fiveHour?.withMetadata(id: "five-hour", label: "5h", durationMinutes: 300),
-                sevenDay?.withMetadata(id: "seven-day", label: "7d", durationMinutes: 10_080),
-            ].compactMap(\.self)
-        }
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(label, forKey: .label)
-        try container.encode(provider, forKey: .provider)
-        try container.encode(sourceHost, forKey: .sourceHost)
-        try container.encode(asOf, forKey: .asOf)
-        try container.encode(status, forKey: .status)
-        try container.encode(windows, forKey: .windows)
-
-        // Keep old app versions useful while the new server rolls out.
-        try container.encodeIfPresent(fiveHour, forKey: .fiveHour)
-        try container.encodeIfPresent(sevenDay, forKey: .sevenDay)
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = PoolIdentityState(rawValue: raw) ?? .unknown
     }
 }
 
-/// Reported by the edge. `authExpired` means the owning client needs a human
-/// sign-in; the collector never refreshes or exports its credentials.
-public enum AccountStatus: String, Codable, Sendable {
+/// The latest collector/provider condition for a pool. Non-OK states may
+/// still carry last-good windows; clients keep those values visible and dim.
+public enum PoolStatus: String, Codable, Sendable, Equatable {
     case ok
     case stale
     case authExpired = "auth_expired"
+    case billingUnavailable = "billing_unavailable"
     case error
     case unknown
 
     public init(from decoder: any Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        self = AccountStatus(rawValue: raw) ?? .unknown
+        self = PoolStatus(rawValue: raw) ?? .unknown
+    }
+}
+
+/// One quota-bearing provider subject. A pool survives account switches and
+/// may have zero, one, or several observer profiles currently bound to it.
+public struct UsagePool: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let provider: UsageProviderKind
+    public let label: String
+    public let identityState: PoolIdentityState
+    public let status: PoolStatus
+    public let sampledAt: Date
+    public let receivedAt: Date
+    public let windows: [UsageWindow]
+    public let profiles: [ObserverProfile]
+
+    public init(
+        id: String,
+        provider: UsageProviderKind,
+        label: String,
+        identityState: PoolIdentityState,
+        status: PoolStatus,
+        sampledAt: Date,
+        receivedAt: Date,
+        windows: [UsageWindow],
+        profiles: [ObserverProfile]
+    ) {
+        self.id = id
+        self.provider = provider
+        self.label = label
+        self.identityState = identityState
+        self.status = status
+        self.sampledAt = sampledAt
+        self.receivedAt = receivedAt
+        self.windows = windows
+        self.profiles = profiles
+    }
+
+}
+
+public enum ObserverProfileState: String, Codable, Sendable, Equatable {
+    case current
+    case recent
+    case stale
+    case unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ObserverProfileState(rawValue: raw) ?? .unknown
+    }
+}
+
+public enum BindingConfidence: String, Codable, Sendable, Equatable {
+    case subject
+    case windowContinuity = "window_continuity"
+    case profileHistory = "profile_history"
+    case provisional
+    case unknown
+
+    public init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = BindingConfidence(rawValue: raw) ?? .unknown
+    }
+}
+
+/// A named local profile observing a pool. `sourceHost` describes the edge;
+/// neither profile nor edge identity is ever reused as the pool identity.
+public struct ObserverProfile: Codable, Sendable, Equatable, Identifiable {
+    public let id: String
+    public let label: String
+    public let sourceHost: String
+    public let lastSeenAt: Date
+    public let state: ObserverProfileState
+    public let bindingConfidence: BindingConfidence
+
+    public init(
+        id: String,
+        label: String,
+        sourceHost: String,
+        lastSeenAt: Date,
+        state: ObserverProfileState,
+        bindingConfidence: BindingConfidence
+    ) {
+        self.id = id
+        self.label = label
+        self.sourceHost = sourceHost
+        self.lastSeenAt = lastSeenAt
+        self.state = state
+        self.bindingConfidence = bindingConfidence
     }
 }
 
@@ -163,8 +176,8 @@ public struct UsageWindow: Codable, Sendable, Equatable, Identifiable {
     public let resetsAt: Date?
 
     public init(
-        id: String = "limit",
-        label: String = "Limit",
+        id: String,
+        label: String,
         durationMinutes: Int? = nil,
         utilization: Double,
         resetsAt: Date?
@@ -177,40 +190,19 @@ public struct UsageWindow: Codable, Sendable, Equatable, Identifiable {
     }
 
     public var fraction: Double { min(max(utilization, 0), 1) }
+}
 
-    fileprivate func withMetadata(id: String, label: String, durationMinutes: Int) -> UsageWindow {
-        UsageWindow(
-            id: id,
-            label: label,
-            durationMinutes: durationMinutes,
-            utilization: utilization,
-            resetsAt: resetsAt
-        )
-    }
+/// Pure, testable capacity selection shared with WidgetKit. Prefix selection
+/// intentionally respects explicit server order rather than generated IDs.
+public enum UsagePoolSelection {
+    public static let mediumCapacity = 5
+    public static let largeCapacity = 8
 
-    private enum CodingKeys: String, CodingKey {
-        case id
-        case label
-        case durationMinutes
-        case utilization
-        case resetsAt
-    }
-
-    public init(from decoder: any Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decodeIfPresent(String.self, forKey: .id) ?? "limit"
-        durationMinutes = try container.decodeIfPresent(Int.self, forKey: .durationMinutes)
-        label = try container.decodeIfPresent(String.self, forKey: .label) ??
-            Self.label(for: durationMinutes)
-        utilization = try container.decode(Double.self, forKey: .utilization)
-        resetsAt = try container.decodeIfPresent(Date.self, forKey: .resetsAt)
-    }
-
-    private static func label(for durationMinutes: Int?) -> String {
-        guard let durationMinutes else { return "Limit" }
-        if durationMinutes == 10_080 { return "7d" }
-        if durationMinutes.isMultiple(of: 1_440) { return "\(durationMinutes / 1_440)d" }
-        if durationMinutes.isMultiple(of: 60) { return "\(durationMinutes / 60)h" }
-        return "\(durationMinutes)m"
+    public static func pools(
+        from snapshot: UsageSnapshot,
+        capacity: Int? = nil
+    ) -> [UsagePool] {
+        guard let capacity else { return snapshot.pools }
+        return Array(snapshot.pools.prefix(max(0, capacity)))
     }
 }

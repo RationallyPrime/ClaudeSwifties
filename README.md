@@ -1,253 +1,281 @@
 # AI Usage
 
-A native SwiftUI app and WidgetKit extension for iPhone and macOS that shows
-Claude and Codex subscription limits, reset times, and reading age.
+AI Usage is a native iPhone/macOS app and WidgetKit extension for trustworthy
+Claude, Codex, and Grok Build quota telemetry. It keeps quota pools separate
+from the profiles and machines observing them, so account switches do not
+rename, duplicate, erase, or move usage backwards.
 
-The Xcode project still uses the historical `ClaudeSwifties` product name, but
-the user-facing app and widget are called **AI Usage**.
+The Xcode project retains the historical `ClaudeSwifties` product name. The
+user-facing app and widget are both named **AI Usage**.
 
-## What is real today
+## What schema 3 models
 
-- One multiplatform app target builds for iOS 17+ and macOS 14+.
-- One widget extension builds for both platforms.
-- The app and widget share endpoint settings, a read token, and the last good
-  snapshot through an App Group.
-- Claude Code readings arrive through its status-line JSON.
-- Codex readings come from Codex's own
-  [`account/rateLimits/read` app-server method](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md#7-rate-limits-chatgpt).
-- A small authenticated aggregator keeps the last reading from every machine so
-  a phone widget can fetch one compact document.
+- **Pool:** one quota-bearing provider subject and one dashboard tile.
+- **Observer profile:** a named local Claude, Codex, or Grok profile that may
+  bind to a different pool after a login switch.
+- **Edge:** the machine and collector installation delivering observations.
+- **Session observation:** one immutable provider reading with its true sample
+  time and identity evidence.
+- **Binding:** the currently observed profile-to-pool relationship. Several
+  profiles may legitimately share one pool.
 
-No collector reads a browser cookie, copies an OAuth token, refreshes a token,
-or calls a private web endpoint directly. Claude and Codex remain the owners of
-their authenticated sessions.
+A pool retains its last good values when no profile is current. Older samples,
+out-of-order retries, duplicate delivery, utilization regressions, and invalid
+reset generations cannot replace newer pool truth. Contradictory Claude
+identity evidence is retained and displayed as a conflict instead of being
+used to destructively relabel a pool.
 
 ## Architecture
 
 ```text
-Claude Code statusLine ─┐
-                        ├── authenticated push ──▶ usage aggregator ──▶ iOS/macOS app + widget
-Codex app-server RPC ───┘                         public HTTPS + read bearer
+Claude status-line JSON ──▶ local atomic spool ─┐
+                                                │
+Codex app-server RPC ─────▶ local atomic spool ─┼─▶ profile supervisor
+                                                │        │
+Grok Build ACP ───────────▶ local atomic spool ─┘        │ per-edge HTTPS
+                                                         ▼
+                                                schema-3 aggregator
+                                                SQLite/WAL projection
+                                                         │ read-only HTTPS
+                                                         ▼
+                                                iOS/macOS app + widget
 ```
 
-Edges push because laptops sleep and roam. The aggregator never dials into a
-machine, and it stores only the latest reading for each account.
+The Claude status-line path performs no network request. A profile-scoped
+supervisor drains complete observations oldest-first, retries with bounded
+exponential backoff and jitter, and deletes a file only after a 2xx response
+acknowledges that exact observation ID. A heartbeat runs at least every five
+minutes so the server can distinguish current, recent, and stale profiles.
 
-## Design rules
+Provider credentials remain inside provider-owned clients:
 
-The display is deliberately conservative:
+- Claude usage comes only from status-line JSON; `claude auth status --json`
+  supplies advisory non-secret identity evidence in the exact profile.
+- Codex uses `account/read` followed by `account/rateLimits/read` through its
+  app-server.
+- Grok uses `grok agent --no-leader stdio`, then `initialize`,
+  `x.ai/auth/info`, and `x.ai/billing`. It creates no session, sends no prompt,
+  invokes no tool, and never calls `x.ai/auth/getBearerToken`.
 
-- A stale number stays visible with its age and reduced emphasis.
-- Passing a reset timestamp does **not** turn an old reading into zero. The
-  account may have been used after the reset without this collector seeing it.
-- An unconfigured app shows no readings. It never substitutes plausible demo
-  percentages for live data.
-- A failed refresh may fall back to the last good snapshot, but the host app
-  labels that result **Cached** and shows the failure.
-- Provider windows carry their own label and duration. The app no longer assumes
-  every service always exposes exactly a five-hour and seven-day pair.
+No collector reads a browser cookie, exports an OAuth/provider bearer, or
+calls a private browser endpoint. Provider identifiers are normalized and
+HMACed locally with the fleet identity key; raw email/account metadata is not
+sent to the aggregator.
 
-WidgetKit controls actual refresh execution. The extension requests a new
-timeline after 15 minutes; iOS or macOS may coalesce that request.
+## Schema-3 read contract
 
-## Repository layout
-
-| Path | Purpose |
-| --- | --- |
-| `UsageKit/Sources/UsageKit` | Wire model, decoding compatibility, freshness, HTTP provider, shared App Group store |
-| `UsageKit/Sources/UsageUI` | SwiftUI meters used by both the host app and widget |
-| `App/` | Multiplatform host app and per-platform entitlements |
-| `Widget/` | Multiplatform WidgetKit extension and per-platform entitlements |
-| `edge/statusline-usage.sh` | Claude status-line renderer and collector |
-| `edge/codex_usage.py` | Codex app-server collector; Python standard library only |
-| `edge/install-codex-collector.sh` | Installs the Codex collector as a five-minute macOS LaunchAgent |
-| `aggregator/` | Bun service, container, persistence, validation, and deployment notes |
-
-## Usage contract
-
-Schema 2 adds provider identity and generic windows. The server also emits
-`five_hour` and `seven_day` compatibility fields when those durations are
-present, so a schema-1 app remains useful during rollout.
+`GET /v3/usage` returns pools in explicit, stable presentation order:
 
 ```json
 {
-  "schema": 2,
-  "generated_at": "2026-08-08T00:20:00Z",
-  "accounts": [
+  "schema": 3,
+  "generated_at": "2026-08-15T15:31:00Z",
+  "pools": [
     {
-      "id": "codex-mac",
-      "label": "Codex · Pro",
-      "provider": "codex",
-      "source_host": "Mac",
-      "as_of": "2026-08-08T00:19:50Z",
+      "id": "claude-opaque-pool-id",
+      "provider": "claude",
+      "label": "Claude · Max 20x",
+      "identity_state": "verified",
       "status": "ok",
+      "sampled_at": "2026-08-15T15:29:58Z",
+      "received_at": "2026-08-15T15:30:03Z",
       "windows": [
         {
-          "id": "primary-10080m",
-          "label": "7d",
-          "duration_minutes": 10080,
-          "utilization": 0.45,
-          "resets_at": "2026-08-09T17:36:32Z"
+          "id": "five-hour",
+          "label": "5h",
+          "duration_minutes": 300,
+          "utilization": 0.58,
+          "resets_at": "2026-08-15T18:00:00Z"
         }
       ],
-      "five_hour": null,
-      "seven_day": {
-        "utilization": 0.45,
-        "resets_at": "2026-08-09T17:36:32Z"
-      }
+      "profiles": [
+        {
+          "id": "desktop-a",
+          "label": "Desktop A",
+          "source_host": "workstation",
+          "last_seen_at": "2026-08-15T15:30:00Z",
+          "state": "current",
+          "binding_confidence": "subject"
+        }
+      ]
     }
   ]
 }
 ```
 
-`utilization` is used capacity from 0 to 1. `resets_at` may be null when a
-provider does not publish a boundary. Unknown account status or provider values
-degrade one tile rather than blanking the complete widget.
+`utilization` is used capacity from `0...1`. Missing windows or reset times are
+absence, never zero. Passing a reset timestamp does not fabricate a zero; the
+last sampled number remains visible with its honest age until a valid new
+generation arrives.
 
-## Run the aggregator
+## Repository layout
 
-Generate two different random tokens:
+| Path | Purpose |
+| --- | --- |
+| `UsageKit/Sources/UsageKit` | Schema-3 models, freshness, ephemeral HTTP transport, Keychain and App Group storage |
+| `UsageKit/Sources/UsageUI` | Pool/profile SwiftUI shared by the app and widget |
+| `App/` | Multiplatform host app and per-platform entitlements |
+| `Widget/` | Multiplatform WidgetKit extension and per-platform entitlements |
+| `edge/ai_usage/` | Python-standard-library contract, providers, spool, supervisor, transport, installer, and doctor |
+| `edge/statusline-usage.sh` | Tiny local-only Claude sensor entry point |
+| `edge/install-*-collector.sh` | Profile-aware Claude, Codex, and Grok installers/uninstallers |
+| `aggregator/` | Bun HTTP service, strict schema, SQLite projection, migration, and generic deployment material |
 
-```bash
-openssl rand -hex 32
-openssl rand -hex 32
+## Run the aggregator locally
+
+The server requires a separate read bearer plus one token digest and
+edge/profile allow-list per collector installation. Keep raw tokens outside the
+repository. Derive each ingest digest through stdin so the bearer is not passed
+to an external command in argv:
+
+```sh
+printf %s "$USAGE_EDGE_TOKEN" | shasum -a 256
 ```
 
-Then run locally:
+Then provide the resulting lowercase digest in `EDGE_CREDENTIALS_JSON`:
 
-```bash
+```sh
 cd aggregator
 bun install --frozen-lockfile
-INGEST_TOKEN=replace-with-ingest-token \
-READ_TOKEN=replace-with-read-token \
+READ_TOKEN=replace-with-private-read-bearer \
+EDGE_CREDENTIALS_JSON='[{"token_sha256":"0000000000000000000000000000000000000000000000000000000000000000","edge_id":"edge-dev","profile_ids":["claude-dev"]}]' \
 DATA_DIR=./.data PORT=8099 \
 bun run src/index.ts
 ```
 
-The production service must be behind HTTPS, retain its `/data` volume, and
-keep the ingest and read tokens distinct. See
-[`aggregator/README.md`](aggregator/README.md) for its threat model and
-[`aggregator/DEPLOY.md`](aggregator/DEPLOY.md) for the current host topology.
+The service exposes public liveness at `/health`; authenticated readiness at
+`/ready`; authenticated conflict/readiness diagnostics at `/doctor`;
+per-edge ingest at `/v3/observations`; and the read projection at `/v3/usage`.
+See [aggregator/README.md](aggregator/README.md) for the full contract and
+[aggregator/DEPLOY.md](aggregator/DEPLOY.md) for generic cutover guidance.
 
-The current personal deployment is live at
-`https://agent-cx53.tail1f9f2e.ts.net`. The app uses
-`https://agent-cx53.tail1f9f2e.ts.net/v1/usage`; that read endpoint still
-requires the private read bearer.
+## Install a collector profile
 
-## Collect Claude
+All providers share the same private configuration inputs:
 
-On every Claude machine, pass that edge's distinct identity and the ingest
-credential to the installer:
+- `AI_USAGE_EDGE_ID`: the machine/installation ID allowed by the server;
+- `AI_USAGE_PROFILE_ID`: a fleet-unique, stable profile ID;
+- `AI_USAGE_PROFILE_LABEL`: the human profile label shown in the UI;
+- `AI_USAGE_ENDPOINT`: the HTTPS aggregator origin or exact
+  `/v3/observations` URL;
+- `AI_USAGE_TOKEN`: this edge's raw ingest bearer;
+- `AI_USAGE_IDENTITY_KEY`: the same private base64 HMAC key on every observer
+  that must recognize a shared provider subject.
 
-```bash
-USAGE_ACCOUNT_ID=claude-team \
-USAGE_LABEL="Claude · Team" \
-USAGE_ENDPOINT=https://your-host/v1/ingest \
-USAGE_TOKEN=replace-with-ingest-token \
+Set the provider profile root as appropriate, then run its installer:
+
+```sh
+CLAUDE_CONFIG_DIR=/absolute/path/to/claude-profile \
 edge/install-claude-collector.sh
 ```
 
-The installer copies the script to `~/.local/libexec/ai-usage`, writes a
-mode-600 config, preserves the previous Claude settings, and points Claude
-Code's `statusLine` at the installed copy. The collector uses `jq` when present
-and Python otherwise; a network or configuration failure cannot break the
-prompt.
-
-Claude's `rate_limits` values appear only after a session has received a model
-response. The script caches the last payload locally, but a cache is not a
-current reading and the UI treats its age accordingly.
-
-## Collect Codex
-
-The Codex collector performs the normal app-server initialization handshake and
-then calls `account/rateLimits/read`. It prefers
-`rateLimitsByLimitId.codex` and uses the backwards-compatible `rateLimits`
-field only when needed.
-
-Try it without pushing:
-
-```bash
-edge/codex_usage.py --print --no-push
-```
-
-Configure `~/.config/codex-usage/config`:
-
-```bash
-CODEX_BIN="$HOME/.local/bin/codex"
-USAGE_ACCOUNT_ID=codex-mac
-USAGE_LABEL="Codex · Pro"
-USAGE_ENDPOINT=https://your-host/v1/ingest
-USAGE_TOKEN=replace-with-ingest-token
-```
-
-Install the five-minute LaunchAgent:
-
-```bash
+```sh
+CODEX_HOME=/absolute/path/to/codex-profile \
 edge/install-codex-collector.sh
 ```
 
-The installer copies the collector to `~/.local/libexec/ai-usage`, preserves
-the config on uninstall, and logs only errors to
-`~/Library/Logs/AIUsage/codex-usage.log`.
+```sh
+AI_USAGE_GROK_HOME=/absolute/path/to/grok-home \
+edge/install-grok-collector.sh
+```
+
+The same scripts support `--uninstall`. Claude installation stores the exact
+prior `statusLine` object in its private manifest, chains that command with the
+same input JSON, avoids recursive wrapping on reinstall, and restores it only
+when the live settings still point to this installation. A drifted status line
+is never overwritten during uninstall.
+
+The installer prints the private config path. Use it for a redacted local
+diagnostic without exposing credentials:
+
+```sh
+edge/ai_usage.py doctor --config /absolute/path/to/config.json
+```
+
+## Apple secret and presentation behavior
+
+The endpoint and cached snapshot remain in the shared App Group. The read
+bearer is stored as a non-synchronizing shared Keychain item using
+`AfterFirstUnlockThisDeviceOnly`; the app and widget resolve their access group
+from the signed target rather than a hardcoded development-team prefix. On the
+first schema-3 launch, a legacy preference token is moved to Keychain and the
+preference copy is deleted only after a successful Keychain write/read.
+
+Networking uses an ephemeral URLSession with cookies, URL cache, and shared
+credential storage disabled. Token-bearing redirects are accepted only on the
+same HTTPS origin. Persisted non-loopback HTTP endpoints are rejected before
+the Keychain token is read.
+
+The host app renders every pool. The medium widget shows five compact pool
+rows in server order; the large widget supports at least eight. Current profile
+labels, shared-pool observers, provisional/identity-conflict warnings, stale
+last-good values, sample age, and reset countdowns are all explicit. The host
+uses a periodic timeline so age/countdowns advance while it remains open.
 
 ## Put it on an iPhone
 
-A native iOS widget is not installed by hosting an `.app` on a web server.
-There are two routes:
+A native widget must be installed through Xcode/TestFlight/App Store delivery;
+hosting an `.app` on a web server is not sufficient.
 
-1. **Immediate development install:** connect the iPhone, enable Developer Mode,
-   select the phone in Xcode, and press Run.
-2. **Ongoing distribution:** archive and upload through App Store Connect, then
-   install through TestFlight or the App Store.
+1. Open `ClaudeSwifties.xcodeproj` and select an Apple development team.
+2. Keep the same App Group and Keychain access group capability on the host app
+   and widget targets.
+3. Select the device, build, and run the `ClaudeSwifties` scheme.
+4. In AI Usage, enter the private HTTPS `/v3/usage` URL and read token.
+5. Add the **AI usage** medium or large widget.
 
-For the direct Xcode route:
-
-1. Open `ClaudeSwifties.xcodeproj`.
-2. In Xcode Settings → Accounts, sign into the Apple developer account for the
-   configured team. This checkout is configured for Hákon's Personal Team;
-   another developer must select their own team.
-3. Keep the same App Group on both targets:
-   `group.is.sokrates.claudeswifties`.
-4. On the iPhone, open Settings → Privacy & Security → Developer Mode, turn it
-   on, restart, confirm, and enter the device passcode.
-5. Select the iPhone as the run destination and run the `ClaudeSwifties`
-   scheme.
-6. In AI Usage, enter the aggregator's HTTPS `/v1/usage` URL and **read** token.
-7. Long-press the Home Screen, add the **AI usage** widget, and choose medium or
-   large.
-
-The app and extension both require the App Group provisioning entitlement.
-A compile-only build is not proof that settings will cross the process boundary;
-inspect the signed app and extension entitlements when diagnosing TestFlight.
+A compile-only build does not prove cross-process credential access. Before a
+production/TestFlight cutover, inspect the signed app and extension
+entitlements and prove that both processes can read the same Keychain item.
 
 ## Verify
 
-```bash
+```sh
 cd UsageKit && swift test
 ```
 
-```bash
+```sh
 cd aggregator && bun install --frozen-lockfile && bun test && bun run check
 ```
 
-```bash
+```sh
 cd edge && python3 -m unittest -v
 ```
 
-```bash
-xcodebuild -scheme ClaudeSwifties -project ClaudeSwifties.xcodeproj \
-  -destination 'generic/platform=iOS Simulator' build
+```sh
+shellcheck edge/install-*.sh edge/*.sh
 ```
 
-```bash
+```sh
 xcodebuild -scheme ClaudeSwifties -project ClaudeSwifties.xcodeproj \
-  -destination 'platform=macOS,arch=arm64' build
+  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
 ```
 
-## Deliberately not covered
+```sh
+xcodebuild -scheme ClaudeSwifties -project ClaudeSwifties.xcodeproj \
+  -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO build
+```
 
-The general OpenAI API usage endpoints report API-key billing, not a ChatGPT
-subscription. That does not make Codex limits unavailable: Codex exposes its
-ChatGPT-backed quota through its own app-server protocol, which is the source
-used here. SuperGrok remains absent because no supported local or public
-consumer-plan usage interface has been established.
+The commit-pinned GitHub Actions workflow runs those gates, an ad-hoc signed
+release-entitlement inspection, and Gitleaks. The separately installed review
+loop requests and routes exact-head review feedback; neither green CI nor a
+scheduled nudge is itself permission to merge.
+
+## Live cutover boundary
+
+Repository tests cannot prove the station/deployment facts required for a real
+cutover. Before retiring schema 2 or rotating away the rollback path, capture a
+redacted schema-3 snapshot and doctor report that prove:
+
+- three distinct Claude pools survive real switches on at least two stations;
+- two profiles sharing one pool are shown together;
+- a deliberately disconnected collector later drains its queued observation;
+- Codex remains live and identity-bound;
+- Grok reports through auth/info + billing without a prompt/model turn;
+- retired read and ingest tokens fail;
+- the signed app and widget share App Group and Keychain access; and
+- no live host coordinates or credentials appear in public artifacts.
+
+Keep live endpoints, hostnames, IP addresses, login targets, deployment paths,
+container names, and token-rotation evidence in the private operations corpus,
+not this public repository.

@@ -1,0 +1,9 @@
+{
+  "apiProvider": "firstParty",
+  "authMethod": "oauth",
+  "email": "profile@example.test",
+  "loggedIn": true,
+  "orgId": "organization-example",
+  "orgName": "Example organization",
+  "subscriptionType": "example"
+}

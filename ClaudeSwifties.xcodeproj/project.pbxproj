@@ -41,7 +41,6 @@
 /* Begin PBXFileReference section */
 		1000000000000000000000C1 /* ClaudeSwifties.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ClaudeSwifties.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1000000000000000000000C2 /* UsageWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = UsageWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		1000000000000000000000E3 /* Widget-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Widget-Info.plist"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -92,7 +91,6 @@
 			children = (
 				1000000000000000000000D1 /* App */,
 				1000000000000000000000D2 /* Widget */,
-				1000000000000000000000E3 /* Widget-Info.plist */,
 				1000000000000000000000E2 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -175,6 +173,9 @@
 							com.apple.ApplicationGroups.iOS = {
 								enabled = 1;
 							};
+							com.apple.Keychain = {
+								enabled = 1;
+							};
 							com.apple.Sandbox = {
 								enabled = 1;
 							};
@@ -184,6 +185,9 @@
 						CreatedOnToolsVersion = 26.6;
 						SystemCapabilities = {
 							com.apple.ApplicationGroups.iOS = {
+								enabled = 1;
+							};
+							com.apple.Keychain = {
 								enabled = 1;
 							};
 							com.apple.Sandbox = {
@@ -323,7 +327,10 @@
 				"ENABLE_APP_SANDBOX[sdk=macosx*]" = YES;
 				"ENABLE_OUTGOING_NETWORK_CONNECTIONS[sdk=macosx*]" = YES;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				"INFOPLIST_FILE[sdk=iphoneos*]" = "ClaudeSwifties.xcodeproj/Info/ClaudeSwifties-iOS.plist";
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "ClaudeSwifties.xcodeproj/Info/ClaudeSwifties-iOS.plist";
+				"INFOPLIST_FILE[sdk=macosx*]" = "ClaudeSwifties.xcodeproj/Info/ClaudeSwifties-macOS.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "AI Usage";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -350,7 +357,10 @@
 				"ENABLE_APP_SANDBOX[sdk=macosx*]" = YES;
 				"ENABLE_OUTGOING_NETWORK_CONNECTIONS[sdk=macosx*]" = YES;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				"INFOPLIST_FILE[sdk=iphoneos*]" = "ClaudeSwifties.xcodeproj/Info/ClaudeSwifties-iOS.plist";
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "ClaudeSwifties.xcodeproj/Info/ClaudeSwifties-iOS.plist";
+				"INFOPLIST_FILE[sdk=macosx*]" = "ClaudeSwifties.xcodeproj/Info/ClaudeSwifties-macOS.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "AI Usage";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -375,7 +385,7 @@
 				"ENABLE_APP_SANDBOX[sdk=macosx*]" = YES;
 				"ENABLE_OUTGOING_NETWORK_CONNECTIONS[sdk=macosx*]" = YES;
 				ENABLE_PREVIEWS = YES;
-				INFOPLIST_FILE = "Widget-Info.plist";
+				INFOPLIST_FILE = "ClaudeSwifties.xcodeproj/Info/UsageWidget.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -401,7 +411,7 @@
 				"ENABLE_APP_SANDBOX[sdk=macosx*]" = YES;
 				"ENABLE_OUTGOING_NETWORK_CONNECTIONS[sdk=macosx*]" = YES;
 				ENABLE_PREVIEWS = YES;
-				INFOPLIST_FILE = "Widget-Info.plist";
+				INFOPLIST_FILE = "ClaudeSwifties.xcodeproj/Info/UsageWidget.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

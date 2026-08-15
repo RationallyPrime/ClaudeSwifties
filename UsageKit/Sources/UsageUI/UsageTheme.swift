@@ -25,6 +25,7 @@ public enum UsageTheme {
         switch provider {
         case .claude: Color(red: 1.000, green: 0.560, blue: 0.105)
         case .codex: Color(red: 0.100, green: 0.585, blue: 1.000)
+        case .grok: Color(red: 0.715, green: 0.370, blue: 1.000)
         case .unknown: Color(red: 0.610, green: 0.660, blue: 0.760)
         }
     }
@@ -33,6 +34,7 @@ public enum UsageTheme {
         switch provider {
         case .claude: Color(red: 1.000, green: 0.780, blue: 0.270)
         case .codex: Color(red: 0.110, green: 0.850, blue: 1.000)
+        case .grok: Color(red: 0.985, green: 0.345, blue: 0.790)
         case .unknown: Color(red: 0.760, green: 0.790, blue: 0.850)
         }
     }
