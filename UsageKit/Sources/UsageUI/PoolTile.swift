@@ -130,13 +130,13 @@ public struct PoolTile: View {
     @ViewBuilder
     private var dashboardProfiles: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("CURRENT PROFILES")
+            Text("PROFILES")
                 .font(.system(size: 9, weight: .bold, design: .rounded))
                 .tracking(0.8)
                 .foregroundStyle(.white.opacity(0.36))
 
-            if currentProfiles.isEmpty {
-                Text(inactiveProfileText)
+            if displayProfiles.isEmpty {
+                Text("No profile has been linked to this pool")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.42))
             } else {
@@ -145,10 +145,19 @@ public struct PoolTile: View {
                     alignment: .leading,
                     spacing: 6
                 ) {
-                    ForEach(currentProfiles) { profile in
-                        Label(profile.label, systemImage: "person.crop.circle.fill")
+                    ForEach(displayProfiles) { profile in
+                        Label(
+                            profile.label,
+                            systemImage: profile.effectiveState(now: now) == .current
+                                ? "person.crop.circle.fill"
+                                : "clock.fill"
+                        )
                             .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.72))
+                            .foregroundStyle(
+                                .white.opacity(
+                                    profile.effectiveState(now: now) == .current ? 0.72 : 0.48
+                                )
+                            )
                             .lineLimit(1)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 5)
@@ -404,24 +413,17 @@ public struct PoolTile: View {
     }
 
     private var compactProfileText: String {
-        let current = currentProfiles.map(\.label)
-        if current.isEmpty { return "No current profile" }
-        return current.joined(separator: " + ")
+        let labels = displayProfiles.map(\.label)
+        if labels.isEmpty { return "No linked profile" }
+        return labels.joined(separator: " + ")
     }
 
     private var compactProfileAndAgeText: String {
         "\(compactProfileText) · \(UsageFormat.age(pool.age(now: now)))"
     }
 
-    private var currentProfiles: [ObserverProfile] {
-        pool.currentProfiles(now: now)
-    }
-
-    private var inactiveProfileText: String {
-        let recentCount = pool.profiles.count { $0.effectiveState(now: now) == .recent }
-        return recentCount == 0
-            ? "No profile is currently observing this pool"
-            : "No current profile · \(recentCount) recently observed"
+    private var displayProfiles: [ObserverProfile] {
+        pool.profilesForDisplay(now: now)
     }
 
     private func meterTextColor(for fraction: Double) -> Color {

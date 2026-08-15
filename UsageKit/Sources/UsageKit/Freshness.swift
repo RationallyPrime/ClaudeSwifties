@@ -115,6 +115,13 @@ extension UsagePool {
     public func currentProfiles(now: Date) -> [ObserverProfile] {
         profiles.filter { $0.effectiveState(now: now) == .current }
     }
+
+    /// Prefer actively observing profiles, but do not hide known pool bindings
+    /// merely because their last heartbeat has aged out of the current window.
+    public func profilesForDisplay(now: Date) -> [ObserverProfile] {
+        let current = currentProfiles(now: now)
+        return current.isEmpty ? profiles : current
+    }
 }
 
 extension Freshness: Comparable {
