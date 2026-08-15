@@ -12,7 +12,7 @@ from typing import Any
 
 from .config import CollectorConfig
 from .contract import Observation
-from .errors import AuthenticationRequired, CollectorError, ProviderError
+from .errors import AuthenticationRequired, CollectorError, ProviderError, SpoolFull
 from .identity import IdentityHint
 from .observation import make_observation
 from .providers import collect_provider, poll_claude_identity
@@ -222,7 +222,10 @@ class Supervisor:
             state.identity_checked_at = now
             self.diagnostics.write("provider_sample_failed", status="auth_expired")
             return None
-        except (ProviderError, OSError) as error:
+        except (CollectorError, OSError) as error:
+            # Provider adapters can raise CollectorError for schema-shaped but
+            # invalid fields (for example a non-numeric Codex resetsAt). Treat
+            # those as a sample failure so previously queued items still drain.
             state.identity_status = "error"
             identity, _ = load_identity(self.config)
             save_identity(self.config, identity, "error", now)
@@ -257,7 +260,13 @@ class Supervisor:
             provider_client_version=reading.provider_client_version,
             pool_label=pool_label,
         )
-        self.spool.enqueue(observation)
+        try:
+            self.spool.enqueue(observation)
+        except SpoolFull:
+            self.diagnostics.write(
+                "spool_full", observation_id=observation.observation_id
+            )
+            return None
         self.spool.save_last_sample(observation)
         state.last_emit_at = now
         return observation
@@ -324,7 +333,13 @@ class Supervisor:
             provider_client_version=client_version,
             pool_label=pool_label,
         )
-        self.spool.enqueue(observation)
+        try:
+            self.spool.enqueue(observation)
+        except SpoolFull:
+            self.diagnostics.write(
+                "spool_full", observation_id=observation.observation_id
+            )
+            return None
         state.last_emit_at = now
         return observation
 

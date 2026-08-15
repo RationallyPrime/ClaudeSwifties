@@ -11,6 +11,7 @@ from ai_usage.identity import IdentityHint
 from ai_usage.observation import make_observation
 from ai_usage.providers import ProviderReading
 from ai_usage.spool import FileLock, Spool
+from ai_usage.errors import CollectorError
 from ai_usage.supervisor import RuntimeState, Supervisor, doctor_report
 from ai_usage.transport import Acknowledgement, DeliveryFailure, ObservationTransport
 from ai_usage.util import UTC
@@ -358,6 +359,72 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(heartbeat.windows, ())
             self.assertEqual(heartbeat.pool_label, config.pool_label)
             self.assertEqual(heartbeat.status, "stale")
+
+    def test_malformed_provider_fields_still_drain_queued_observations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), "codex")
+            queued = observation(config)
+            Spool(config).enqueue(queued)
+            transport = RecordingTransport()
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            with mock.patch(
+                "ai_usage.supervisor.collect_provider",
+                side_effect=CollectorError(
+                    "Codex primary.resetsAt must be a Unix timestamp"
+                ),
+            ):
+                result = supervisor.run()
+            self.assertFalse(result["already_running"])
+            self.assertEqual(result["queued"], 0)
+            self.assertEqual(result["delivered"], 1)
+            self.assertEqual(Spool(config).stats()["pending"], 0)
+            self.assertEqual(transport.sent[0].observation_id, queued.observation_id)
+
+    def test_full_spool_skips_new_sample_but_still_drains(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), "codex", spool_max_count=8)
+            spool = Spool(config)
+            for sequence in range(8):
+                spool.enqueue(
+                    make_observation(
+                        config,
+                        sequence=sequence,
+                        observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+                        sampled_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+                        sample_time_quality="sensor_time",
+                        status="ok",
+                        identity=IdentityHint(chr(65 + sequence) * 43, "account_id"),
+                        windows=[
+                            QuotaWindow(
+                                "five-hour", "5h", 300, 0.1, "2026-08-15T13:00:00Z"
+                            )
+                        ],
+                    )
+                )
+            transport = RecordingTransport()
+            reading = ProviderReading(
+                IdentityHint("Z" * 43, "account_id"),
+                [QuotaWindow("five-hour", "5h", 300, 0.2, "2026-08-15T13:00:00Z")],
+                "ok",
+                "Codex · Account",
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            with mock.patch(
+                "ai_usage.supervisor.collect_provider", return_value=reading
+            ):
+                result = supervisor.run()
+            self.assertEqual(result["queued"], 0)
+            self.assertEqual(result["delivered"], 8)
+            self.assertEqual(spool.stats()["pending"], 0)
+            self.assertEqual(len(transport.sent), 8)
+            follow_up = Supervisor(
+                config, transport=RecordingTransport(), clock=lambda: 1001
+            )
+            with mock.patch(
+                "ai_usage.supervisor.collect_provider", return_value=reading
+            ) as collect:
+                follow_up.run()
+                collect.assert_not_called()
 
     def test_doctor_is_redacted_and_diagnostics_are_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
