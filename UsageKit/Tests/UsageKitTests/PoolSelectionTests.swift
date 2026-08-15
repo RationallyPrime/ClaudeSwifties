@@ -56,4 +56,16 @@ private func snapshot(count: Int) -> UsageSnapshot {
     let pool = testPool(sampledAt: now, profiles: profiles)
 
     #expect(pool.currentProfiles(now: now).map(\.label) == ["Desktop A", "Edge profile B"])
+    #expect(pool.profilesForDisplay(now: now).map(\.label) == ["Desktop A", "Edge profile B"])
+}
+
+@Test func poolKeepsKnownProfilesVisibleWhenNoneAreCurrent() {
+    let profiles = [
+        testProfile(id: "recent", label: "Recently observed", now: now, state: .recent),
+        testProfile(id: "stale", label: "Known profile", now: now, state: .stale),
+    ]
+    let pool = testPool(sampledAt: now, profiles: profiles)
+
+    #expect(pool.currentProfiles(now: now).isEmpty)
+    #expect(pool.profilesForDisplay(now: now).map(\.label) == ["Recently observed", "Known profile"])
 }
