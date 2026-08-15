@@ -1708,8 +1708,7 @@ def redeliver_standing_wake(
     messages[0] = f"{redelivery_notice(verdict_stamp)}\n\n{messages[0]}"
 
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
-    for message in messages:
-        slack.post_message(message)
+    post_threaded_messages(slack, messages)
     # Slack first, then the marker. A Slack failure leaves no marker, so the next
     # tick retries — duplicate delivery is the safe direction. A marker failure
     # after a successful post raises out of the scan rather than being swallowed.
