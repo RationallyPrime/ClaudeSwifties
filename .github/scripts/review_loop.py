@@ -11,10 +11,15 @@ Commands:
     Route one native Codex result: a submitted findings review goes to Talos;
     a bot-authored clean PR comment — in either verdict format Codex emits —
     goes to the authoring seat.  A Codex comment that looks like a verdict but
-    cannot be routed is reported to Hive rather than dropped.
+    cannot be routed is reported to Hive rather than dropped.  At the
+    exhaustion gate the authoring seat gets the human gate and Theoros
+    additionally gets a retrospective wake carrying the per-round history.
 ``nudge``
     Add one ``@codex review`` comment (with an exact-head marker) per stalled,
-    unreviewed head until the bounded automatic loop is exhausted.
+    unreviewed head until the bounded automatic loop is exhausted, and
+    re-deliver a standing verdict once per *reviewed* head whose seat never
+    acted.  A wake fires exactly once from an event-driven path; a consumed
+    wake with no new GitHub event is otherwise silence forever.
 ``canary``
     Post a harmless Talos liveness wake for end-to-end verification.
 """
@@ -37,8 +42,18 @@ CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 WORKFLOW_LOGIN = "github-actions[bot]"
 MAX_REVIEW_ROUNDS = 3
 REVIEW_STALL_SECONDS = 20 * 60
+# Deliberately separate from REVIEW_STALL_SECONDS: that window bounds how long a
+# head may wait for a *verdict*, while this one bounds how long a delivered
+# verdict may sit unacted.  Burns routinely run past twenty minutes, so reusing
+# the nudge window would wake a working seat mid-burn every scan.  At an hour,
+# the worst case is one redundant wake, which seat dedupe doctrine makes safe.
+WAKE_REDELIVERY_SECONDS = 60 * 60
+DIGEST_CHUNK_BUDGET = 12000
+ROUND_LOCATION_LINE_BUDGET = 8000
 EXHAUSTED_MARKER_PREFIX = "<!-- weave-review-loop:exhausted:"
 NUDGE_MARKER_PREFIX = "<!-- weave-review-loop:nudge:"
+REDELIVERY_MARKER_PREFIX = "<!-- weave-review-loop:redelivered:"
+UNRESOLVED_CLEAN_PREFIX = "unresolved-clean:"
 CODEX_CLEAN_COMMENT_PREFIX = "Codex Review: Didn't find any major issues."
 CODEX_RESULT_HEADING = "## Review Result"
 CODEX_RESULT_CLEAN_PHRASE = "no blocking findings"
@@ -182,11 +197,14 @@ class SlackApi(JsonApi):
         )
         self.channel = channel
 
-    def post_message(self, text: str) -> None:
+    def post_message(self, text: str, *, thread_ts: str | None = None) -> str:
+        payload: dict[str, Any] = {"channel": self.channel, "text": text}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
         result = self.request(
             "POST",
             "chat.postMessage",
-            payload={"channel": self.channel, "text": text},
+            payload=payload,
         )
         if not isinstance(result, dict) or result.get("ok") is not True:
             error = (
@@ -195,6 +213,24 @@ class SlackApi(JsonApi):
                 else "invalid_response"
             )
             raise RuntimeError(f"Slack chat.postMessage failed: {error}")
+        ts = result.get("ts")
+        if not isinstance(ts, str) or not ts:
+            raise RuntimeError("Slack chat.postMessage returned no ts")
+        return ts
+
+
+def post_threaded_messages(slack: SlackApi, messages: Sequence[str]) -> None:
+    """Post the first message as a Slack root; later chunks reply in its thread.
+
+    Hive binds a seat to the thread of a WAKE delivery. Continuations posted as
+    their own roots never share that affinity, so a chunked retrospective would
+    leave Theoros with only the first chunk.
+    """
+    if not messages:
+        return
+    thread_ts = slack.post_message(messages[0])
+    for message in messages[1:]:
+        slack.post_message(message, thread_ts=thread_ts)
 
 
 def load_event() -> dict[str, Any]:
@@ -240,11 +276,16 @@ def author_for_pr(
 
 
 def review_findings(
-    github: GitHubApi, pr_number: int, review_id: int, codex_login: str
+    comments: Sequence[Mapping[str, Any]], review_id: int, codex_login: str
 ) -> list[dict[str, Any]]:
+    """Select one review's inline Codex findings from the PR's comment list.
+
+    The comment list is fetched once and filtered per review, so building a
+    whole-PR round history costs no additional API calls.
+    """
     findings: list[dict[str, Any]] = []
-    for comment in github.paginate(f"pulls/{pr_number}/comments"):
-        user = comment.get("user") if isinstance(comment, Mapping) else None
+    for comment in comments:
+        user = comment.get("user")
         if not isinstance(user, Mapping) or user.get("login") != codex_login:
             continue
         if comment.get("pull_request_review_id") != review_id:
@@ -427,28 +468,95 @@ def clean_comment_head(
     return resolved
 
 
+def codex_result_events(
+    github: GitHubApi,
+    reviews: Sequence[Mapping[str, Any]],
+    comments: Sequence[Mapping[str, Any]],
+    codex_login: str,
+) -> list[tuple[datetime, int, str, str]]:
+    """Return time-ordered Codex results as ``(time, order, head, kind)``.
+
+    ``kind`` is ``findings`` for a submitted review and ``clean`` for a clean
+    comment.  Both channels are retained — including a later CLEAN on a head
+    that already had findings — so a retrospective can pick the later verdict
+    without treating the earlier review as current.
+
+    A stale short commit can become unresolvable after history changes. It still
+    consumed an automatic review round, so retain a namespaced short key for the
+    bounded-loop count without ever treating it as exact-head closure.
+
+    Finding-reviews and clean comments are independent channels. Listing one
+    channel then the other is not chronological, so a retrospective would number
+    a later findings head before an earlier CLEAN. Merge by timestamp before
+    treating the list as round order.
+    """
+    events: list[tuple[datetime, int, str, str]] = []
+    for review in reviews:
+        user = review.get("user")
+        if not isinstance(user, Mapping) or user.get("login") != codex_login:
+            continue
+        head_sha = str(review.get("commit_id") or "").strip()
+        if not head_sha:
+            continue
+        events.append(
+            (
+                result_event_time(review.get("submitted_at")),
+                len(events),
+                head_sha,
+                "findings",
+            )
+        )
+    for comment in comments:
+        commitish = clean_comment_commitish(comment, codex_login, github.repository)
+        if commitish is None:
+            continue
+        resolved = clean_comment_head(github, comment, codex_login)
+        result_head = resolved or f"{UNRESOLVED_CLEAN_PREFIX}{commitish}"
+        events.append(
+            (
+                result_event_time(comment.get("created_at")),
+                len(events),
+                result_head,
+                "clean",
+            )
+        )
+    events.sort()
+    return events
+
+
+def result_heads_from_events(
+    events: Sequence[tuple[datetime, int, str, str]],
+) -> list[str]:
+    """Distinct heads in first-seen time order; a later event does not add a round."""
+    heads: list[str] = []
+    for _, _, head, _ in events:
+        if head not in heads:
+            heads.append(head)
+    return heads
+
+
+def latest_result_kind_by_head(
+    events: Sequence[tuple[datetime, int, str, str]],
+) -> dict[str, str]:
+    """Later of findings-review vs clean-comment for each head."""
+    latest: dict[str, tuple[datetime, int, str]] = {}
+    for at, order, head, kind in events:
+        previous = latest.get(head)
+        if previous is None or (at, order) >= (previous[0], previous[1]):
+            latest[head] = (at, order, kind)
+    return {head: kind for head, (_, _, kind) in latest.items()}
+
+
 def codex_result_heads(
     github: GitHubApi,
     reviews: Sequence[Mapping[str, Any]],
     comments: Sequence[Mapping[str, Any]],
     codex_login: str,
 ) -> list[str]:
-    """Return distinct finding-review and clean-comment heads.
-
-    A stale short commit can become unresolvable after history changes. It still
-    consumed an automatic review round, so retain a namespaced short key for the
-    bounded-loop count without ever treating it as exact-head closure.
-    """
-    heads = codex_review_heads(reviews, codex_login)
-    for comment in comments:
-        commitish = clean_comment_commitish(comment, codex_login, github.repository)
-        if commitish is None:
-            continue
-        resolved = clean_comment_head(github, comment, codex_login)
-        result_head = resolved or f"unresolved-clean:{commitish}"
-        if result_head not in heads:
-            heads.append(result_head)
-    return heads
+    """Return distinct finding-review and clean-comment heads in time order."""
+    return result_heads_from_events(
+        codex_result_events(github, reviews, comments, codex_login)
+    )
 
 
 def result_round_for_head(reviewed_heads: Sequence[str], head_sha: str) -> int:
@@ -465,6 +573,89 @@ def review_round_for_head(
     return result_round_for_head(codex_review_heads(reviews, codex_login), head_sha)
 
 
+def round_history(
+    reviewed_heads: Sequence[str],
+    reviews: Sequence[Mapping[str, Any]],
+    review_comments: Sequence[Mapping[str, Any]],
+    codex_login: str,
+    *,
+    latest_kind_by_head: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Describe every consumed round in round order: head, verdict, findings.
+
+    A retrospective needs the shape of the whole sequence, so this covers the
+    same head set the bounded round count is drawn from — clean-comment rounds
+    included.  A round whose inline comments are not retrievable is never
+    reported as CLEAN: only a Codex clean comment establishes that, and an
+    absence establishes nothing.  When a later clean comment supersedes an
+    earlier findings review on the same unchanged head, the later CLEAN is
+    the verdict.  Reviews are deduplicated by id because the submitted review
+    under routing is also present in the paginated list.  Only the latest
+    findings review per head supplies the digest: an earlier review's comments
+    on the same unchanged head are superseded by the later review's own
+    complete assessment (an intervening CLEAN may have resolved them), so
+    merging rounds would hand Theoros findings that are no longer live.
+    """
+    latest_review_by_head: dict[str, tuple[datetime, int, int]] = {}
+    seen_reviews: set[int] = set()
+    for review in reviews:
+        user = review.get("user")
+        if not isinstance(user, Mapping) or user.get("login") != codex_login:
+            continue
+        head = str(review.get("commit_id") or "").strip()
+        review_id = review.get("id")
+        if not head or review_id is None or int(review_id) in seen_reviews:
+            continue
+        seen_reviews.add(int(review_id))
+        candidate = (
+            result_event_time(review.get("submitted_at")),
+            len(seen_reviews),
+            int(review_id),
+        )
+        previous = latest_review_by_head.get(head)
+        if previous is None or candidate[:2] >= previous[:2]:
+            latest_review_by_head[head] = candidate
+    findings_by_head: dict[str, list[dict[str, Any]]] = {
+        head: review_findings(review_comments, review_id, codex_login)
+        for head, (_, _, review_id) in latest_review_by_head.items()
+    }
+    latest_kind = dict(latest_kind_by_head or {})
+    history: list[dict[str, Any]] = []
+    for index, head in enumerate(reviewed_heads, start=1):
+        findings = list(findings_by_head.get(head, []))
+        kind = latest_kind.get(head)
+        if head.startswith(UNRESOLVED_CLEAN_PREFIX) or kind == "clean":
+            verdict = (
+                "CLEAN (clean comment whose commit no longer resolves)"
+                if head.startswith(UNRESOLVED_CLEAN_PREFIX)
+                else "CLEAN (Codex clean comment)"
+            )
+            findings = []
+        elif head not in findings_by_head:
+            verdict = "CLEAN (Codex clean comment)"
+        elif findings:
+            verdict = "findings review"
+        else:
+            verdict = (
+                "findings review submitted, 0 inline comments retrievable "
+                "(not evidence of CLEAN)"
+            )
+        history.append(
+            {
+                "round": index,
+                "rounds": len(reviewed_heads),
+                "head": head,
+                "verdict": verdict,
+                "counts": severity_counts(findings),
+                "locations": [
+                    f"{finding.get('path', '?')}:{finding.get('line', '?')}"
+                    for finding in findings
+                ],
+            }
+        )
+    return history
+
+
 def exhaustion_marker(head_sha: str) -> str:
     return f"{EXHAUSTED_MARKER_PREFIX}{head_sha} -->"
 
@@ -476,6 +667,35 @@ def nudge_marker(head_sha: str) -> str:
 def nudge_comment_body(head_sha: str) -> str:
     """Codex trigger plus an exact-head marker so force-pushes cannot reuse it."""
     return f"@codex review\n{nudge_marker(head_sha)}"
+
+
+def redelivery_marker(head_sha: str) -> str:
+    return f"{REDELIVERY_MARKER_PREFIX}{head_sha} -->"
+
+
+def redelivery_comment_body(head_sha: str, verdict_at: str) -> str:
+    """The once-per-head record that a standing verdict was re-delivered.
+
+    Deliberately carries no ``@codex`` trigger: redelivery re-delivers attention
+    to a seat, it never summons another review.  The nudge leg owns summoning.
+    """
+    return (
+        "Review-loop: the standing verdict for this head was re-delivered to "
+        f"#hive (original verdict `{verdict_at}`; the head has not moved "
+        "since). One redelivery per head — a push starts a fresh review cycle.\n"
+        f"{redelivery_marker(head_sha)}"
+    )
+
+
+def redelivery_notice(verdict_at: str) -> str:
+    """The line that tells the receiving seat this wake is not a new dispatch."""
+    return (
+        f"REDELIVERY — restating a standing review-loop verdict first delivered "
+        f"at `{verdict_at}`; the head has not moved since, so the action below "
+        "is still outstanding. Per `universe/30-hive.md`, check whether the work "
+        "already happened before redoing it: a repeated wake is never a second "
+        "dispatch, and it adds no review round and no authority."
+    )
 
 
 def exhaustion_gate(
@@ -622,10 +842,15 @@ def finding_blocks(
 
 
 def chunk_digest(
-    header: str, blocks: Sequence[str], *, budget: int = 12000
+    header: str,
+    blocks: Sequence[str],
+    *,
+    label: str,
+    budget: int = DIGEST_CHUNK_BUDGET,
 ) -> list[str]:
+    """Split a digest across Slack messages; ``label`` names it in continuations."""
     if not blocks:
-        return [f"{header}(no inline comment bodies)"]
+        return [f"{header}(no {label} entries)"]
     messages: list[str] = []
     prefix = header
     current: list[str] = []
@@ -634,7 +859,7 @@ def chunk_digest(
         separator = 1 if current else 0
         if current and used + separator + len(block) > budget:
             messages.append(prefix + "\n".join(current))
-            prefix = f"(finding digest continued — part {len(messages) + 1})\n\n"
+            prefix = f"({label} continued — part {len(messages) + 1})\n\n"
             current = [block]
             used = len(prefix) + len(block)
         else:
@@ -684,7 +909,130 @@ def build_burn_messages(
         "the digest intact (R-3: failures stay visible).\n\n"
         "## Finding digest\n"
     )
-    return chunk_digest(header, finding_blocks(findings))
+    return chunk_digest(header, finding_blocks(findings), label="finding digest")
+
+
+def location_lines(
+    locations: Sequence[str], *, max_len: int = ROUND_LOCATION_LINE_BUDGET
+) -> list[str]:
+    """Split a Locations line so one round cannot overrun the digest budget."""
+    prefix = "Locations: "
+    room = max_len - len(prefix)
+    if room < 1:
+        raise ValueError("max_len is too small for a Locations line")
+    if not locations:
+        return []
+    lines: list[str] = []
+    current: list[str] = []
+    used = 0
+
+    def fit(location: str) -> str:
+        if len(location) <= room:
+            return location
+        return f"{location[: room - 1]}…"
+
+    for location in locations:
+        item = fit(str(location))
+        extra = len(item) if not current else len(item) + 2
+        if current and used + extra > room:
+            lines.append(prefix + ", ".join(current))
+            current = [item]
+            used = len(item)
+        else:
+            current.append(item)
+            used += extra
+    if current:
+        lines.append(prefix + ", ".join(current))
+    return lines
+
+
+def round_history_blocks(
+    history: Sequence[Mapping[str, Any]], current_head: str
+) -> list[str]:
+    """Render self-labelling blocks per round so any chunk split stays legible.
+
+    A single review can name enough locations to exceed ``chunk_digest``'s
+    budget. Locations are split into continued blocks, each still labelled
+    with the round and head.
+    """
+    blocks: list[str] = []
+    for entry in history:
+        counts = entry["counts"]
+        head = str(entry["head"])
+        marker = " **(current head)**" if head == current_head else ""
+        title = f"### Round {entry['round']}/{entry['rounds']} — `{head}`{marker}"
+        if not counts["total"]:
+            blocks.append(f"{title}\nVerdict: {entry['verdict']}.\n")
+            continue
+        verdict = (
+            f"Verdict: {entry['verdict']} — {counts['p1']} P1 / "
+            f"{counts['p2']} P2 / {counts['p3']} P3 ({counts['total']} total)."
+        )
+        loc_lines = location_lines([str(item) for item in entry["locations"]])
+        if not loc_lines:
+            blocks.append(f"{title}\n{verdict}\n")
+            continue
+        blocks.append(f"{title}\n{verdict}\n{loc_lines[0]}\n")
+        continued = f"{title} (locations continued)"
+        for loc_line in loc_lines[1:]:
+            blocks.append(f"{continued}\n{loc_line}\n")
+    return blocks
+
+
+def build_retrospective_messages(
+    *,
+    findings: Sequence[Mapping[str, Any]],
+    history: Sequence[Mapping[str, Any]],
+    pr_url: str,
+    branch: str,
+    head_sha: str,
+    repository: str,
+    author: str,
+    author_actor: str,
+    review_round: int,
+) -> list[str]:
+    """Ask Theoros why burning could not close this PR, and what generalises."""
+    header = (
+        "WAKE: theoros\n\n"
+        "Review-loop hook: the bounded automatic loop is exhausted — "
+        f"{review_round} reviewed head(s) consumed against an automatic bound "
+        f"of {MAX_REVIEW_ROUNDS}, and burning did not close this PR. You are "
+        "asked for a retrospective verdict. This wake carries no repair, "
+        "re-review, or merge authority.\n\n"
+        f"PR: {pr_url}\n"
+        f"Branch: `{branch}`\n"
+        f"Head: `{head_sha}`\n"
+        f"Repo: `{repository}`\n"
+        f"Author: `{author}` (seat `{author_actor}`)\n"
+        f"Rounds consumed: {review_round} (automatic bound: "
+        f"{MAX_REVIEW_ROUNDS}) — a PR whose rounds predate the bound reads "
+        "above it.\n\n"
+        "The human gate is already on the PR and the authoring seat is already "
+        "woken; nothing waits on this verdict.\n\n"
+        "What is asked:\n\n"
+        "1. **Name the structural cause** — which property was being "
+        "established, and why repeated repair could not establish it. "
+        '"No structural cause; the finding classes were independent" is a '
+        "valid and valuable verdict — some PRs are simply large. Never "
+        "conclude from absence: report the gap and stop.\n"
+        "2. **Codify what generalises** — a new scar-assert on an existing "
+        "skill (preferred; `skills/writing-skills/SKILL.md` §4 makes "
+        "refinement the default) or, rarely, a new skill. Provenance is "
+        "mandatory: PR, findings, round count, claimed scope. Silence is a "
+        "legitimate outcome — a one-off does not earn a corpus entry, and a "
+        "corpus of noise is worse than a small one.\n"
+        "3. **Post the verdict on the PR** so it is attached to the evidence, "
+        "not only to this thread. Skill changes ride a review-ready PR to "
+        "weave-doctrine; merge stays Hákon's word.\n\n"
+        "The evidence below is the shape of the sequence: did severity fall, "
+        "did the same file keep reappearing, did each burn draw new findings.\n\n"
+        "## Per-round history, then the current head's findings\n"
+    )
+    blocks = [
+        *round_history_blocks(history, head_sha),
+        *finding_blocks(findings),
+    ]
+    return chunk_digest(header, blocks, label="retrospective evidence")
 
 
 def clean_wake_message(
@@ -749,12 +1097,14 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         print("non-seat author - no wake")
         return
     author, author_actor = resolved
-    findings = review_findings(github, pr_number, int(review["id"]), codex_login)
+    review_comments = github.paginate(f"pulls/{pr_number}/comments")
+    findings = review_findings(review_comments, int(review["id"]), codex_login)
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
     conversation_comments = github.paginate(f"issues/{pr_number}/comments")
-    reviewed_heads = codex_result_heads(
+    result_events = codex_result_events(
         github, [*reviews, review], conversation_comments, codex_login
     )
+    reviewed_heads = result_heads_from_events(result_events)
     review_round = result_round_for_head(reviewed_heads, review_head_sha)
     refreshed_pr = refresh_pr_at_head(github, pr_number, review_head_sha, repository)
     if refreshed_pr is None:
@@ -851,6 +1201,34 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         print(
             f"review loop exhausted for {repository}#{pr_number} "
             f"(head={head_sha}, findings={len(findings)})"
+        )
+        # The gate comment and the authoring-seat wake are already published:
+        # the retrospective is a third message that never gates or delays them,
+        # and a failure here terminalizes visibly instead of being swallowed.
+        history = round_history(
+            reviewed_heads,
+            [*reviews, review],
+            review_comments,
+            codex_login,
+            latest_kind_by_head=latest_result_kind_by_head(result_events),
+        )
+        post_threaded_messages(
+            slack,
+            build_retrospective_messages(
+                findings=findings,
+                history=history,
+                pr_url=pr_url,
+                branch=branch,
+                head_sha=head_sha,
+                repository=repository,
+                author=author,
+                author_actor=author_actor,
+                review_round=review_round,
+            ),
+        )
+        print(
+            f"woke theoros for {repository}#{pr_number} retrospective "
+            f"(rounds={len(history)})"
         )
         return
 
@@ -1035,6 +1413,19 @@ def parse_github_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def result_event_time(raw: Any) -> datetime:
+    """Parse a GitHub event timestamp; undated events sort first, then by input order."""
+    if not isinstance(raw, str) or not raw.strip():
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = parse_github_time(raw.strip())
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def commit_time(commit: Mapping[str, Any], fallback: str) -> datetime:
     nested = commit.get("commit")
     if isinstance(nested, Mapping):
@@ -1077,6 +1468,227 @@ def bare_nudge_covers_head(
     return marker_comment_exists(comments, nudge_marker(head_sha))
 
 
+def exact_head_codex_reviews(
+    reviews: Sequence[Mapping[str, Any]], head_sha: str, codex_login: str
+) -> list[Mapping[str, Any]]:
+    """Codex reviews submitted against this exact head, in review order."""
+    wanted = head_sha.lower()
+    matched: list[Mapping[str, Any]] = []
+    for review in reviews:
+        user = review.get("user")
+        if not isinstance(user, Mapping) or user.get("login") != codex_login:
+            continue
+        if str(review.get("commit_id") or "").strip().lower() == wanted:
+            matched.append(review)
+    return matched
+
+
+def standing_verdict_time(
+    github: GitHubApi,
+    reviews: Sequence[Mapping[str, Any]],
+    comments: Sequence[Mapping[str, Any]],
+    head_sha: str,
+    codex_login: str,
+) -> datetime | None:
+    """When Codex last published a verdict for this exact head.
+
+    Both verdict channels count: a submitted review's ``submitted_at`` and a
+    clean comment's ``created_at``.  The *latest* is the anchor — the window
+    measures how long the current verdict has stood unacted, so a re-review
+    restarts it rather than inheriting the first delivery's age.
+    """
+    stamps: list[datetime] = []
+    for review in exact_head_codex_reviews(reviews, head_sha, codex_login):
+        submitted = str(review.get("submitted_at") or "").strip()
+        if submitted:
+            stamps.append(parse_github_time(submitted))
+    for comment in comments:
+        created = str(comment.get("created_at") or "").strip()
+        if not created:
+            continue
+        if clean_comment_head(github, comment, codex_login) == head_sha.lower():
+            stamps.append(parse_github_time(created))
+    return max(stamps) if stamps else None
+
+
+def standing_findings(
+    github: GitHubApi,
+    pr_number: int,
+    reviews: Sequence[Mapping[str, Any]],
+    codex_login: str,
+) -> list[dict[str, Any]]:
+    """Every inline finding still standing on one unchanged head.
+
+    Reading only the newest review undercounts: a re-review of unchanged bytes
+    emits a second review whose inline set can be disjoint from the first.  On a
+    head that has not moved, nothing has resolved either set — only a push
+    resolves a finding, and a push changes the head — so the standing set is the
+    union.  Each inline comment belongs to exactly one review, so the union is a
+    concatenation with no deduplication to do.  The comment list is fetched once
+    and filtered per review, matching ``review_findings``'s contract.
+    """
+    review_comments = list(github.paginate(f"pulls/{pr_number}/comments"))
+    findings: list[dict[str, Any]] = []
+    for review in reviews:
+        findings.extend(
+            review_findings(review_comments, int(review["id"]), codex_login)
+        )
+    return findings
+
+
+def redeliver_standing_wake(
+    github: GitHubApi,
+    *,
+    pull_request: Mapping[str, Any],
+    pr_number: int,
+    head_sha: str,
+    reviews: Sequence[Mapping[str, Any]],
+    comments: Sequence[Mapping[str, Any]],
+    reviewed_heads: Sequence[str],
+    repository: str,
+    codex_login: str,
+    now: datetime,
+) -> bool:
+    """Re-deliver one standing verdict for an already-reviewed head.
+
+    Every review-loop wake fires exactly once, from an event-driven path.  A
+    seat that consumed the wake without acting produces no further GitHub event,
+    so the standing findings become invisible: the only clock-driven leg skips
+    reviewed heads outright.  This is the backstop for that silence — attention
+    only.  It adds no review round, no repair authority, and no merge authority,
+    and it never summons a reviewer.
+
+    "Acted" is a head change: any push produces a new head and a fresh review
+    cycle, so an unchanged head past the window is a stall by definition.
+    """
+    if marker_comment_exists(comments, exhaustion_marker(head_sha)):
+        # An exhaustion gate's terminal action is "stop and hold for the human".
+        # That is observationally identical to consumed-without-action, and the
+        # attention contract's "silence means stop safely" is load-bearing:
+        # re-delivering it would convert a deliberate stop into pressure to act.
+        return False
+    if marker_comment_exists(comments, redelivery_marker(head_sha)):
+        return False
+
+    verdict_at = standing_verdict_time(github, reviews, comments, head_sha, codex_login)
+    if verdict_at is None:
+        print(
+            f"no timestamped Codex verdict for {repository}#{pr_number} "
+            f"(head={head_sha}); nothing to re-deliver"
+        )
+        return False
+    if (now - verdict_at).total_seconds() < WAKE_REDELIVERY_SECONDS:
+        return False
+    verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    exact_reviews = exact_head_codex_reviews(reviews, head_sha, codex_login)
+    # No exact-head review means the verdict came from a clean comment, which
+    # carries no inline findings by construction — so this costs no API call.
+    findings = (
+        standing_findings(github, pr_number, exact_reviews, codex_login)
+        if exact_reviews
+        else []
+    )
+    listed_labels = {
+        str(label.get("name"))
+        for label in pull_request.get("labels", [])
+        if isinstance(label, Mapping)
+    }
+    if not findings and "merge-on-green" not in listed_labels:
+        # Cost pre-filter on the listed PR, re-checked authoritatively below: a
+        # plain CLEAN head is parked at ready-for-review forever, and paying two
+        # lookups per scan for a state that never redelivers is pure waste.
+        return False
+    if findings and len(reviewed_heads) >= MAX_REVIEW_ROUNDS:
+        # Defence behind the exhaustion marker above, for a head whose gate
+        # comment failed to post: automation has stopped either way.
+        return False
+
+    resolved = author_for_pr(github, pr_number, head_sha)
+    if resolved is None:
+        return False
+    author, author_actor = resolved
+
+    pr_state = refresh_pr_at_head(
+        github, pr_number, head_sha, repository, action="wake redelivery"
+    )
+    if pr_state is None:
+        return False
+    if str(pr_state.get("state") or "") != "open":
+        print(
+            f"ignored wake redelivery for a closed {repository}#{pr_number} "
+            f"(head={head_sha})"
+        )
+        return False
+    refreshed_head = pr_state.get("head")
+    if not isinstance(refreshed_head, Mapping):
+        raise TypeError("live pull_request.head is missing")
+    labels = {
+        str(label.get("name"))
+        for label in pr_state.get("labels", [])
+        if isinstance(label, Mapping)
+    }
+    has_merge_on_green = "merge-on-green" in labels
+    if not findings and not has_merge_on_green:
+        # The live label, not the listed one: ready-for-review is a correct
+        # parked state, and only merge-on-green CLEAN carries a standing
+        # mechanical action to re-deliver.
+        return False
+    branch = str(refreshed_head["ref"])
+    pr_url = str(pr_state.get("html_url") or f"{repository}#{pr_number}")
+    review_round = result_round_for_head(reviewed_heads, head_sha)
+    word = merge_word(has_merge_on_green)
+
+    if findings:
+        messages = build_burn_messages(
+            findings=findings,
+            review_state=str(exact_reviews[-1].get("state") or "unknown"),
+            word=word,
+            pr_url=pr_url,
+            branch=branch,
+            head_sha=head_sha,
+            repository=repository,
+            author=author,
+            author_actor=author_actor,
+            has_merge_on_green=has_merge_on_green,
+            review_round=review_round,
+        )
+    else:
+        messages = [
+            clean_wake_message(
+                author_actor=author_actor,
+                author=author,
+                head_sha=head_sha,
+                review_round=review_round,
+                review_state=(
+                    str(exact_reviews[-1].get("state") or "unknown")
+                    if exact_reviews
+                    else "clean-comment"
+                ),
+                word=word,
+                pr_url=pr_url,
+                branch=branch,
+            )
+        ]
+    messages[0] = f"{redelivery_notice(verdict_stamp)}\n\n{messages[0]}"
+
+    slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
+    for message in messages:
+        slack.post_message(message)
+    # Slack first, then the marker. A Slack failure leaves no marker, so the next
+    # tick retries — duplicate delivery is the safe direction. A marker failure
+    # after a successful post raises out of the scan rather than being swallowed.
+    github.post(
+        f"issues/{pr_number}/comments",
+        {"body": redelivery_comment_body(head_sha, verdict_stamp)},
+    )
+    print(
+        f"re-delivered standing wake for {repository}#{pr_number} "
+        f"(head={head_sha}, findings={len(findings)}, verdict={verdict_stamp})"
+    )
+    return True
+
+
 def nudge_stalled_reviews() -> None:
     repository = required_env("GITHUB_REPOSITORY")
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
@@ -1090,6 +1702,7 @@ def nudge_stalled_reviews() -> None:
         )
     now = datetime.now(timezone.utc)
     nudged = 0
+    redelivered = 0
     for pull_request in github.paginate("pulls", query={"state": "open"}):
         head = pull_request.get("head")
         if not isinstance(head, Mapping):
@@ -1107,6 +1720,24 @@ def nudge_stalled_reviews() -> None:
         comments = github.paginate(f"issues/{pr_number}/comments")
         reviewed_heads = codex_result_heads(github, reviews, comments, codex_login)
         if head_sha in reviewed_heads:
+            # A reviewed head needs no reviewer, but its verdict may still be
+            # standing unacted. The commit-age gate above is already satisfied
+            # here: a verdict old enough to re-deliver sits on a commit that is
+            # older still, and the future-commit fallback clears twenty minutes
+            # of PR quiet on its own.
+            if redeliver_standing_wake(
+                github,
+                pull_request=pull_request,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                reviews=reviews,
+                comments=comments,
+                reviewed_heads=reviewed_heads,
+                repository=repository,
+                codex_login=codex_login,
+                now=now,
+            ):
+                redelivered += 1
             continue
         if len(reviewed_heads) >= MAX_REVIEW_ROUNDS:
             marker = exhaustion_marker(head_sha)
@@ -1153,7 +1784,7 @@ def nudge_stalled_reviews() -> None:
         )
         nudged += 1
         print(f"nudged PR #{pr_number}")
-    print(f"nudge scan complete (nudged={nudged})")
+    print(f"nudge scan complete (nudged={nudged}, redelivered={redelivered})")
 
 
 def send_canary() -> None:
