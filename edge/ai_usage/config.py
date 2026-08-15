@@ -49,6 +49,12 @@ def _endpoint(value: Any) -> str:
     if not isinstance(value, str):
         raise ConfigError("endpoint must be a URL")
     parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ConfigError("endpoint port must be a valid integer") from error
+    if port is not None and not 1 <= port <= 65_535:
+        raise ConfigError("endpoint port must be within 1..65535")
     if (
         parsed.scheme not in {"https", "http"}
         or not parsed.hostname

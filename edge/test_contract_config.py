@@ -150,6 +150,18 @@ class ConfigTests(unittest.TestCase):
                     ),
                 )
 
+    def test_invalid_endpoint_port_is_rejected_during_parse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(ConfigError, "endpoint port"):
+                CollectorConfig.from_mapping(
+                    root / "config.json",
+                    config_mapping(
+                        root,
+                        endpoint="https://collector.example:bad/v3/observations",
+                    ),
+                )
+
     def test_loopback_http_is_allowed_for_falsifiers(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary), endpoint="http://127.0.0.1:9000")
