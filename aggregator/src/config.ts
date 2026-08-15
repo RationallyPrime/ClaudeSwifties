@@ -122,6 +122,7 @@ function parseEdgeCredentials(raw: string): EdgeCredential[] {
 
   const credentials: EdgeCredential[] = [];
   const hashes = new Set<string>();
+  const profileOwners = new Map<string, string>();
   for (const [index, item] of value.entries()) {
     const field = `EDGE_CREDENTIALS_JSON[${index}]`;
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -148,6 +149,15 @@ function parseEdgeCredentials(raw: string): EdgeCredential[] {
     );
     if (new Set(profileIds).size !== profileIds.length) {
       throw new Error(`${field}.profile_ids must be unique`);
+    }
+    for (const profileId of profileIds) {
+      const owner = profileOwners.get(profileId);
+      if (owner !== undefined && owner !== edgeId) {
+        throw new Error(
+          `${field}.profile_ids contains ${profileId} already assigned to edge ${owner}`,
+        );
+      }
+      profileOwners.set(profileId, edgeId);
     }
 
     credentials.push({

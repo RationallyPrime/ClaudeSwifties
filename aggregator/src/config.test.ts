@@ -92,6 +92,24 @@ describe("parseRuntimeConfig", () => {
     })).toThrow(/duplicated/);
   });
 
+  test("rejects the same profile id assigned to two edges", () => {
+    expect(() => parseRuntimeConfig({
+      ...validEnv(),
+      EDGE_CREDENTIALS_JSON: JSON.stringify([
+        {
+          token_sha256: digestToken(EDGE_TOKEN).toString("hex"),
+          edge_id: "edge-linux",
+          profile_ids: ["desktop-a"],
+        },
+        {
+          token_sha256: digestToken("other-edge-token-012345").toString("hex"),
+          edge_id: "edge-mac",
+          profile_ids: ["laptop-b", "desktop-a"],
+        },
+      ]),
+    })).toThrow(/desktop-a already assigned to edge edge-linux/);
+  });
+
   test("rejects role reuse between read and ingest credentials", () => {
     expect(() => parseRuntimeConfig({
       READ_TOKEN,
