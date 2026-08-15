@@ -1,14 +1,42 @@
 /**
- * Provider-neutral wire contract. Schema 2 adds provider identity and generic
- * quota windows; five_hour/seven_day remain on responses so an older app can
- * keep working during rollout.
+ * Schema 3 is intentionally observation- and pool-centric. It has no schema-2
+ * parser: the only old-format support lives in the one-shot store migration.
+ *
+ * The parser is strict at every object boundary. Besides catching producer
+ * drift early, this is a credential-leak tripwire: a collector that
+ * accidentally adds a token, email, or provider response cannot be silently
+ * accepted and persisted.
  */
 
-export type AccountStatus = "ok" | "stale" | "auth_expired" | "error";
-export type UsageProvider = "claude" | "codex" | "unknown";
-
-const STATUSES: readonly AccountStatus[] = ["ok", "stale", "auth_expired", "error"];
-const PROVIDERS: readonly UsageProvider[] = ["claude", "codex", "unknown"];
+export type UsageProvider = "claude" | "codex" | "grok";
+export type PoolStatus =
+  | "ok"
+  | "stale"
+  | "auth_expired"
+  | "billing_unavailable"
+  | "error";
+export type SampleTimeQuality =
+  | "provider_time"
+  | "transcript_mtime"
+  | "sensor_time"
+  | "unknown";
+export type IdentityEvidence =
+  | "org_email"
+  | "org"
+  | "email"
+  | "account_id"
+  | "workspace_id"
+  | "principal_id"
+  | "team_id"
+  | "organization_id"
+  | "unknown";
+export type PoolIdentityState = "verified" | "provisional" | "conflict";
+export type ProfileState = "current" | "recent" | "stale";
+export type BindingConfidence =
+  | "subject"
+  | "window_continuity"
+  | "profile_history"
+  | "provisional";
 
 export interface UsageWindow {
   id: string;
@@ -18,163 +46,316 @@ export interface UsageWindow {
   resets_at: string | null;
 }
 
-export interface LegacyUsageWindow {
-  utilization: number;
-  resets_at: string;
+export interface UsageObservation {
+  schema: 3;
+  observation_id: string;
+  sequence: number;
+  provider: UsageProvider;
+  edge_id: string;
+  profile_id: string;
+  profile_label: string;
+  pool_label: string;
+  session_id: string | null;
+  source_host: string;
+  collector_version: string;
+  provider_client_version: string | null;
+  observed_at: string;
+  sampled_at: string;
+  sample_time_quality: SampleTimeQuality;
+  status: PoolStatus;
+  provider_subject: string | null;
+  identity_evidence: IdentityEvidence;
+  windows: UsageWindow[];
 }
 
-export interface AccountUsage {
+export interface PoolProfile {
   id: string;
   label: string;
-  provider: UsageProvider;
   source_host: string;
-  as_of: string;
-  status: AccountStatus;
+  last_seen_at: string;
+  state: ProfileState;
+  binding_confidence: BindingConfidence;
+}
+
+export interface UsagePool {
+  id: string;
+  provider: UsageProvider;
+  label: string;
+  identity_state: PoolIdentityState;
+  status: PoolStatus;
+  sampled_at: string;
+  received_at: string;
   windows: UsageWindow[];
-  five_hour: LegacyUsageWindow | null;
-  seven_day: LegacyUsageWindow | null;
+  profiles: PoolProfile[];
 }
 
 export interface UsageSnapshot {
-  schema: 2;
+  schema: 3;
   generated_at: string;
-  accounts: AccountUsage[];
+  pools: UsagePool[];
 }
 
-const MAX_STRING = 128;
-const ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
-const WINDOW_ID_PATTERN = /^[A-Za-z0-9._-]{1,32}$/;
+const PROVIDERS: readonly UsageProvider[] = ["claude", "codex", "grok"];
+const STATUSES: readonly PoolStatus[] = [
+  "ok",
+  "stale",
+  "auth_expired",
+  "billing_unavailable",
+  "error",
+];
+const SAMPLE_QUALITIES: readonly SampleTimeQuality[] = [
+  "provider_time",
+  "transcript_mtime",
+  "sensor_time",
+  "unknown",
+];
+const IDENTITY_EVIDENCE: readonly IdentityEvidence[] = [
+  "org_email",
+  "org",
+  "email",
+  "account_id",
+  "workspace_id",
+  "principal_id",
+  "team_id",
+  "organization_id",
+  "unknown",
+];
+
+const OBSERVATION_FIELDS = new Set([
+  "schema",
+  "observation_id",
+  "sequence",
+  "provider",
+  "edge_id",
+  "profile_id",
+  "profile_label",
+  "pool_label",
+  "session_id",
+  "source_host",
+  "collector_version",
+  "provider_client_version",
+  "observed_at",
+  "sampled_at",
+  "sample_time_quality",
+  "status",
+  "provider_subject",
+  "identity_evidence",
+  "windows",
+]);
+const WINDOW_FIELDS = new Set([
+  "id",
+  "label",
+  "duration_minutes",
+  "utilization",
+  "resets_at",
+]);
+
+const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SUBJECT_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 
-export class ValidationError extends Error {}
+export class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ValidationError";
+  }
+}
 
-function requireString(value: unknown, field: string, max = MAX_STRING): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > max) {
+function requireObject(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ValidationError(`${field} must be a JSON object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function rejectUnknownFields(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  field: string,
+): void {
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
+  if (unknown.length > 0) {
+    throw new ValidationError(`${field} contains unknown field(s): ${unknown.join(", ")}`);
+  }
+}
+
+function requireString(value: unknown, field: string, max: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > max ||
+    value.trim().length === 0
+  ) {
     throw new ValidationError(`${field} must be a string of 1..${max} chars`);
+  }
+  if (CONTROL_CHARACTERS.test(value)) {
+    throw new ValidationError(`${field} must not contain control characters`);
   }
   return value;
 }
 
-function requireTimestamp(value: unknown, field: string): string {
+function requireOptionalString(value: unknown, field: string, max: number): string | null {
+  if (value === null) return null;
+  return requireString(value, field, max);
+}
+
+function requireIdentifier(value: unknown, field: string, max = 64): string {
+  const result = requireString(value, field, max);
+  if (!ID_PATTERN.test(result)) {
+    throw new ValidationError(`${field} must contain only letters, numbers, dot, underscore, or dash`);
+  }
+  return result;
+}
+
+export function parseTimestamp(value: unknown, field: string): string {
   const raw = requireString(value, field, 64);
   if (!ISO_INSTANT.test(raw)) {
     throw new ValidationError(`${field} must be an ISO-8601 UTC instant`);
   }
   const parsed = Date.parse(raw);
-  if (Number.isNaN(parsed)) throw new ValidationError(`${field} is not a valid timestamp`);
-  return new Date(parsed).toISOString();
+  if (!Number.isFinite(parsed)) {
+    throw new ValidationError(`${field} is not a valid timestamp`);
+  }
+  const date = new Date(parsed);
+  const components = [
+    Number(raw.slice(0, 4)),
+    Number(raw.slice(5, 7)) - 1,
+    Number(raw.slice(8, 10)),
+    Number(raw.slice(11, 13)),
+    Number(raw.slice(14, 16)),
+    Number(raw.slice(17, 19)),
+  ];
+  const normalized = [
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate(),
+    date.getUTCHours(),
+    date.getUTCMinutes(),
+    date.getUTCSeconds(),
+  ];
+  if (components.some((component, index) => component !== normalized[index])) {
+    throw new ValidationError(`${field} is not a valid timestamp`);
+  }
+  return date.toISOString();
 }
 
-function parseUtilization(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new ValidationError(`${field} must be a finite number`);
-  }
-  if (value < 0 || value > 1) {
-    throw new ValidationError(`${field} must be within 0..1, got ${value}`);
-  }
-  return value;
-}
-
-function parseLegacyWindow(
+function requireEnum<T extends string>(
   value: unknown,
   field: string,
-  id: string,
-  label: string,
-  durationMinutes: number,
-): UsageWindow | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== "object") throw new ValidationError(`${field} must be an object or null`);
-
-  const record = value as Record<string, unknown>;
-  return {
-    id,
-    label,
-    duration_minutes: durationMinutes,
-    utilization: parseUtilization(record.utilization, `${field}.utilization`),
-    resets_at: requireTimestamp(record.resets_at, `${field}.resets_at`),
-  };
+  allowed: readonly T[],
+): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new ValidationError(`${field} must be one of ${allowed.join(", ")}`);
+  }
+  return value as T;
 }
 
 function parseWindow(value: unknown, index: number): UsageWindow {
   const field = `windows[${index}]`;
-  if (typeof value !== "object" || value === null) {
-    throw new ValidationError(`${field} must be an object`);
-  }
-  const record = value as Record<string, unknown>;
-  const id = requireString(record.id, `${field}.id`, 32);
-  if (!WINDOW_ID_PATTERN.test(id)) {
-    throw new ValidationError(`${field}.id must match [A-Za-z0-9._-]{1,32}`);
-  }
+  const record = requireObject(value, field);
+  rejectUnknownFields(record, WINDOW_FIELDS, field);
 
   const duration = record.duration_minutes;
-  if (duration !== null && duration !== undefined &&
-      (!Number.isInteger(duration) || (duration as number) < 1 || (duration as number) > 525_600)) {
-    throw new ValidationError(`${field}.duration_minutes must be null or an integer within 1..525600`);
+  if (
+    duration !== null &&
+    (!Number.isSafeInteger(duration) || (duration as number) < 1 || (duration as number) > 5_256_000)
+  ) {
+    throw new ValidationError(
+      `${field}.duration_minutes must be null or an integer within 1..5256000`,
+    );
   }
 
-  const resetsAt = record.resets_at;
+  const utilization = record.utilization;
+  if (typeof utilization !== "number" || !Number.isFinite(utilization)) {
+    throw new ValidationError(`${field}.utilization must be a finite number`);
+  }
+  if (utilization < 0 || utilization > 1) {
+    throw new ValidationError(`${field}.utilization must be within 0..1`);
+  }
+
   return {
-    id,
-    label: requireString(record.label, `${field}.label`, 16),
-    duration_minutes: duration == null ? null : duration as number,
-    utilization: parseUtilization(record.utilization, `${field}.utilization`),
-    resets_at: resetsAt == null ? null : requireTimestamp(resetsAt, `${field}.resets_at`),
+    id: requireIdentifier(record.id, `${field}.id`, 64),
+    label: requireString(record.label, `${field}.label`, 32),
+    duration_minutes: duration as number | null,
+    utilization,
+    resets_at: record.resets_at === null
+      ? null
+      : parseTimestamp(record.resets_at, `${field}.resets_at`),
   };
 }
 
-function legacyShape(window: UsageWindow | undefined): LegacyUsageWindow | null {
-  if (!window?.resets_at) return null;
-  return { utilization: window.utilization, resets_at: window.resets_at };
-}
+export function parseObservation(input: unknown): UsageObservation {
+  const record = requireObject(input, "body");
+  rejectUnknownFields(record, OBSERVATION_FIELDS, "body");
 
-export function parseAccount(input: unknown): AccountUsage {
-  if (typeof input !== "object" || input === null) {
-    throw new ValidationError("body must be a JSON object");
-  }
-  const record = input as Record<string, unknown>;
-
-  const id = requireString(record.id, "id", 64);
-  if (!ID_PATTERN.test(id)) throw new ValidationError("id must match [A-Za-z0-9._-]{1,64}");
-
-  const status = record.status;
-  if (typeof status !== "string" || !STATUSES.includes(status as AccountStatus)) {
-    throw new ValidationError(`status must be one of ${STATUSES.join(", ")}`);
+  if (record.schema !== 3) {
+    throw new ValidationError("schema must be 3");
   }
 
-  const providerValue = record.provider ?? (id.toLowerCase().startsWith("codex") ? "codex" : "claude");
-  if (typeof providerValue !== "string" || !PROVIDERS.includes(providerValue as UsageProvider)) {
-    throw new ValidationError(`provider must be one of ${PROVIDERS.join(", ")}`);
+  const observationId = requireString(record.observation_id, "observation_id", 36);
+  if (!UUID_PATTERN.test(observationId)) {
+    throw new ValidationError("observation_id must be an RFC-4122 UUID");
   }
 
-  let windows: UsageWindow[];
-  if (record.windows !== undefined) {
-    if (!Array.isArray(record.windows) || record.windows.length > 4) {
-      throw new ValidationError("windows must be an array with at most 4 entries");
-    }
-    windows = record.windows.map(parseWindow);
-  } else {
-    windows = [
-      parseLegacyWindow(record.five_hour, "five_hour", "five-hour", "5h", 300),
-      parseLegacyWindow(record.seven_day, "seven_day", "seven-day", "7d", 10_080),
-    ].filter((window): window is UsageWindow => window !== null);
+  if (!Number.isSafeInteger(record.sequence) || (record.sequence as number) < 0) {
+    throw new ValidationError("sequence must be a non-negative safe integer");
   }
 
+  if (!Array.isArray(record.windows) || record.windows.length > 16) {
+    throw new ValidationError("windows must be an array with at most 16 entries");
+  }
+  const windows = record.windows.map(parseWindow);
   if (new Set(windows.map((window) => window.id)).size !== windows.length) {
-    throw new ValidationError("window ids must be unique within an account");
+    throw new ValidationError("window ids must be unique within an observation");
   }
 
-  const fiveHour = windows.find((window) => window.duration_minutes === 300 || window.id === "five-hour");
-  const sevenDay = windows.find((window) => window.duration_minutes === 10_080 || window.id === "seven-day");
+  const providerSubject = record.provider_subject === null
+    ? null
+    : requireString(record.provider_subject, "provider_subject", 128);
+  if (providerSubject !== null && !SUBJECT_PATTERN.test(providerSubject)) {
+    throw new ValidationError("provider_subject must be a 16..128 char opaque base64url digest");
+  }
+  const identityEvidence = requireEnum(
+    record.identity_evidence,
+    "identity_evidence",
+    IDENTITY_EVIDENCE,
+  );
+  if (providerSubject === null && identityEvidence !== "unknown") {
+    throw new ValidationError("identity_evidence must be unknown without provider_subject");
+  }
 
   return {
-    id,
-    label: requireString(record.label, "label"),
-    provider: providerValue as UsageProvider,
-    source_host: requireString(record.source_host, "source_host"),
-    as_of: requireTimestamp(record.as_of, "as_of"),
-    status: status as AccountStatus,
+    schema: 3,
+    observation_id: observationId.toLowerCase(),
+    sequence: record.sequence as number,
+    provider: requireEnum(record.provider, "provider", PROVIDERS),
+    edge_id: requireIdentifier(record.edge_id, "edge_id"),
+    profile_id: requireIdentifier(record.profile_id, "profile_id"),
+    profile_label: requireString(record.profile_label, "profile_label", 128),
+    pool_label: requireString(record.pool_label, "pool_label", 128),
+    session_id: record.session_id === null
+      ? null
+      : requireIdentifier(record.session_id, "session_id", 128),
+    source_host: requireString(record.source_host, "source_host", 128),
+    collector_version: requireString(record.collector_version, "collector_version", 64),
+    provider_client_version: requireOptionalString(
+      record.provider_client_version,
+      "provider_client_version",
+      64,
+    ),
+    observed_at: parseTimestamp(record.observed_at, "observed_at"),
+    sampled_at: parseTimestamp(record.sampled_at, "sampled_at"),
+    sample_time_quality: requireEnum(
+      record.sample_time_quality,
+      "sample_time_quality",
+      SAMPLE_QUALITIES,
+    ),
+    status: requireEnum(record.status, "status", STATUSES),
+    provider_subject: providerSubject,
+    identity_evidence: identityEvidence,
     windows,
-    five_hour: legacyShape(fiveHour),
-    seven_day: legacyShape(sevenDay),
   };
 }

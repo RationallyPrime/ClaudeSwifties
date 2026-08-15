@@ -1,17 +1,5 @@
-# Coolify service template for the eventual permanent host.
-#
-# Topology notes specific to this box:
-#   * No published ports and no Traefik. Exposure is a cloudflared sidecar,
-#     with DNS as a proxied CNAME to {tunnel-id}.cfargotunnel.com.
-#   * This is an API, not a frontend, so it stays BEARER-ONLY and must never go
-#     behind CF Access — a widget extension cannot perform an interactive auth
-#     flow, and CF Access would make the widget permanently unable to fetch.
-#   * Token values are `${VAR}` placeholders on purpose. Coolify interpolates
-#     service envs at deploy time; a literal here would be served to the widget
-#     as the string "${USAGE_READ_TOKEN}" and every fetch would 401.
-#
-# Deliberately its own service rather than a member of the demo stack, so demo
-# reseeds and kernel image trains can never touch this volume.
+# Generic single-service template. Connect it to a deployment-owned private
+# listener or HTTPS reverse proxy without committing live topology here.
 
 services:
   usage-aggregator:
@@ -22,26 +10,19 @@ services:
     environment:
       - PORT=8080
       - DATA_DIR=/data
-      - MAX_ACCOUNTS=16
-      - INGEST_TOKEN=${USAGE_INGEST_TOKEN}
+      - MAX_POOLS=64
+      - EDGE_CREDENTIALS_JSON=${USAGE_EDGE_CREDENTIALS_JSON}
       - READ_TOKEN=${USAGE_READ_TOKEN}
+      - REQUIRE_LEGACY_IMPORT=${USAGE_REQUIRE_LEGACY_IMPORT:-false}
     volumes:
       - usage-data:/data
     healthcheck:
       # Unauthenticated by design, and therefore NOT proof of anything but
-      # liveness — see the bearer-path check in the verification ladder.
+      # liveness. Authenticated /ready is a separate deployment gate.
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 5s
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run --token ${USAGE_TUNNEL_TOKEN}
-    depends_on:
-      - usage-aggregator
-
 volumes:
   usage-data:

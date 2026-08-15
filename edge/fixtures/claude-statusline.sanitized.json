@@ -1,0 +1,18 @@
+{
+  "session_id": "session-example",
+  "version": "2.1.220",
+  "model": {
+    "display_name": "Opus"
+  },
+  "transcript_path": "/sanitized/session.jsonl",
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 12,
+      "resets_at": 1786200000
+    },
+    "seven_day": {
+      "used_percentage": 34,
+      "resets_at": 1786800000
+    }
+  }
+}

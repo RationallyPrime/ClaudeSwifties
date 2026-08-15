@@ -5,48 +5,62 @@ import Testing
 
 private let now = Date(timeIntervalSince1970: 1_786_100_000)
 
-private func account(
-    minutesOld: Double,
-    status: AccountStatus = .ok
-) -> AccountUsage {
-    AccountUsage(
-        id: "test",
-        label: "Test",
-        sourceHost: "edge",
-        asOf: now.addingTimeInterval(-minutesOld * 60),
+private func pool(minutesOld: Double, status: PoolStatus = .ok) -> UsagePool {
+    testPool(
         status: status,
-        // Deliberately still open, so these cases exercise age handling alone
-        // and never trip the window-reset inference.
-        fiveHour: UsageWindow(utilization: 0.5, resetsAt: now.addingTimeInterval(3600)),
-        sevenDay: nil
+        sampledAt: now.addingTimeInterval(-minutesOld * 60),
+        // A recent server receipt must not disguise an old provider sample.
+        receivedAt: now.addingTimeInterval(-30)
     )
 }
 
-@Test func freshnessTracksAge() {
-    #expect(account(minutesOld: 2).freshness(now: now) == .fresh)
-    #expect(account(minutesOld: 15).freshness(now: now) == .fresh)
-    #expect(account(minutesOld: 16).freshness(now: now) == .aging)
-    #expect(account(minutesOld: 61).freshness(now: now) == .stale)
+@Test func freshnessTracksProviderSampleAge() {
+    #expect(pool(minutesOld: 2).freshness(now: now) == .fresh)
+    #expect(pool(minutesOld: 15).freshness(now: now) == .fresh)
+    #expect(pool(minutesOld: 16).freshness(now: now) == .aging)
+    #expect(pool(minutesOld: 61).freshness(now: now) == .stale)
 }
 
-/// The edge saying "stale" outranks a clock that merely looks recent — the edge
-/// knows things the timestamp doesn't.
+@Test func recentReceiptDoesNotMakeOldSampleFresh() {
+    let stale = pool(minutesOld: 180)
+    #expect(stale.receivedAt > stale.sampledAt)
+    #expect(stale.tileState(now: now) == .live(.stale))
+}
+
 @Test func edgeReportedStaleIsNeverShownAsFresh() {
-    let recentButFlagged = account(minutesOld: 1, status: .stale)
-    #expect(recentButFlagged.tileState(now: now) == .live(.aging))
+    #expect(pool(minutesOld: 1, status: .stale).tileState(now: now) == .live(.aging))
 }
 
-@Test func authExpiredHidesNumbers() {
-    let expired = account(minutesOld: 1, status: .authExpired)
-    #expect(expired.tileState(now: now) == .authExpired)
-    #expect(expired.tileState(now: now).showsNumbers == false)
-    #expect(account(minutesOld: 1).tileState(now: now).showsNumbers == true)
+@Test func degradedPoolKeepsLastGoodNumbersVisible() {
+    let authExpired = pool(minutesOld: 20, status: .authExpired)
+    #expect(authExpired.tileState(now: now) == .degraded(.aging, .authExpired))
+    #expect(authExpired.tileState(now: now).showsNumbers)
+
+    let withoutLastGood = testPool(
+        status: .billingUnavailable,
+        sampledAt: now,
+        windows: []
+    )
+    #expect(withoutLastGood.tileState(now: now) == .unavailable(.billingUnavailable))
 }
 
-/// Clock skew between an edge and the phone must not produce negative ages.
 @Test func futureTimestampsClampToZeroAge() {
-    #expect(account(minutesOld: -30).age(now: now) == 0)
-    #expect(account(minutesOld: -30).freshness(now: now) == .fresh)
+    let future = pool(minutesOld: -30)
+    #expect(future.age(now: now) == 0)
+    #expect(future.freshness(now: now) == .fresh)
+}
+
+@Test func cachedCurrentProfileProgressesToRecentThenStale() {
+    let profile = testProfile(now: now, state: .current)
+
+    #expect(profile.effectiveState(now: now.addingTimeInterval(15 * 60)) == .current)
+    #expect(profile.effectiveState(now: now.addingTimeInterval(16 * 60)) == .recent)
+    #expect(profile.effectiveState(now: now.addingTimeInterval(24 * 60 * 60 + 1)) == .stale)
+}
+
+@Test func serverReportedRecentIsNeverPromotedByClientClock() {
+    let profile = testProfile(now: now, state: .recent)
+    #expect(profile.effectiveState(now: now) == .recent)
 }
 
 @Test func countdownFormatting() {

@@ -3,65 +3,65 @@ import Testing
 
 @testable import UsageKit
 
-/// Captured verbatim from a running aggregator, after a real statusline payload
-/// went through `edge/statusline-usage.sh`. If the service's output drifts from
-/// what the widget can decode, this fails instead of the widget going blank.
+/// Contract fixture shared with the schema-3 aggregator implementation. It
+/// includes a pool with no current observer to prove the read model preserves
+/// last-good quota truth independently of profile bindings.
 private let capturedResponse = """
 {
-  "schema": 1,
-  "generated_at": "2026-08-07T23:36:41.754Z",
-  "accounts": [
+  "schema": 3,
+  "generated_at": "2026-08-15T18:36:41.754Z",
+  "pools": [
     {
-      "id": "rp-team",
-      "label": "Team · rationallyprime",
-      "source_host": "Mac",
-      "as_of": "2026-08-07T23:36:39.000Z",
-      "status": "ok",
-      "five_hour": {
-        "utilization": 0.423,
-        "resets_at": "2026-08-07T19:13:20.000Z"
-      },
-      "seven_day": {
-        "utilization": 0.71,
-        "resets_at": "2026-08-09T18:26:40.000Z"
-      }
-    },
-    {
-      "id": "sokrates-team",
-      "label": "Sokrates · Team",
-      "source_host": "Mac",
-      "as_of": "2026-08-07T23:36:44.000Z",
-      "status": "ok",
-      "five_hour": null,
-      "seven_day": {
-        "utilization": 0.08,
-        "resets_at": "2026-08-09T18:26:40.000Z"
-      }
+      "id": "claude-pool-a",
+      "provider": "claude",
+      "label": "Claude · Team",
+      "identity_state": "provisional",
+      "status": "stale",
+      "sampled_at": "2026-08-15T16:36:39Z",
+      "received_at": "2026-08-15T16:36:44Z",
+      "windows": [
+        {
+          "id": "seven-day",
+          "label": "7d",
+          "duration_minutes": 10080,
+          "utilization": 0.71,
+          "resets_at": "2026-08-14T18:26:40Z"
+        }
+      ],
+      "profiles": [
+        {
+          "id": "old-profile",
+          "label": "Former observer",
+          "source_host": "edge",
+          "last_seen_at": "2026-08-14T12:00:00Z",
+          "state": "stale",
+          "binding_confidence": "profile_history"
+        }
+      ]
     }
   ]
 }
 """
 
-@Test func decodesRealAggregatorOutput() throws {
+@Test func decodesAggregatorSchema3Projection() throws {
     let snapshot = try JSONDecoder.usageDecoder()
         .decode(UsageSnapshot.self, from: Data(capturedResponse.utf8))
+    let pool = try #require(snapshot.pools.first)
 
-    #expect(snapshot.accounts.count == 2)
-    #expect(snapshot.accounts[0].label == "Team · rationallyprime")
-    #expect(snapshot.accounts[0].fiveHour?.fraction == 0.423)
-    // An account whose session had only produced one window yet.
-    #expect(snapshot.accounts[1].fiveHour == nil)
-    #expect(snapshot.accounts[1].sevenDay?.fraction == 0.08)
+    #expect(snapshot.schema == 3)
+    #expect(pool.identityState == .provisional)
+    #expect(pool.status == .stale)
+    #expect(pool.currentProfiles(now: snapshot.generatedAt).isEmpty)
+    #expect(pool.profiles.first?.bindingConfidence == .profileHistory)
+    #expect(pool.windows.first?.fraction == 0.71)
 }
 
-/// A historical reset timestamp never licenses the client to invent a current
-/// zero; the reading remains the old 42.3% and its age carries the warning.
-@Test func pastBoundaryInRealPayloadDoesNotFabricateZero() throws {
+@Test func passedResetInProjectionNeverFabricatesZero() throws {
     let snapshot = try JSONDecoder.usageDecoder()
         .decode(UsageSnapshot.self, from: Data(capturedResponse.utf8))
-    let account = snapshot.accounts[0]
-    let now = account.asOf.addingTimeInterval(10 * 60)
+    let pool = try #require(snapshot.pools.first)
+    let now = pool.sampledAt.addingTimeInterval(10 * 60)
 
-    #expect(account.fiveHour?.fraction == 0.423)
-    #expect(account.tileState(now: now) == .live(.fresh))
+    #expect(pool.windows.first?.fraction == 0.71)
+    #expect(pool.tileState(now: now) == .live(.aging))
 }

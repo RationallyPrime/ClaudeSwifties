@@ -5,7 +5,6 @@ import WidgetKit
 
 struct ContentView: View {
     @State private var refreshState: UsageRefreshState = .unconfigured
-    @State private var now = Date()
     @State private var endpoint = ""
     @State private var token = ""
     @State private var validationMessage: String?
@@ -13,7 +12,18 @@ struct ContentView: View {
     @State private var saved = false
     @State private var isConnectionExpanded = false
 
-    private let store = UsageStore.shared()
+    private let store: UsageStore?
+    private let storeConfigurationError: String?
+
+    init() {
+        do {
+            store = try UsageStore.shared()
+            storeConfigurationError = nil
+        } catch {
+            store = nil
+            storeConfigurationError = error.localizedDescription
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -25,12 +35,14 @@ struct ContentView: View {
                         hero
                         refreshNotice
 
-                        UsageSummaryView(
-                            snapshot: refreshState.snapshot,
-                            now: now,
-                            emptyMessage: "Connect the private feed below",
-                            style: .dashboard
-                        )
+                        TimelineView(.periodic(from: .now, by: 30)) { timeline in
+                            UsageSummaryView(
+                                snapshot: refreshState.snapshot,
+                                now: timeline.date,
+                                emptyMessage: "Connect the private feed below",
+                                style: .dashboard
+                            )
+                        }
 
                         connectionPanel
                     }
@@ -131,7 +143,7 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 statusPill
 
-                Text(accountSummary)
+                Text(poolSummary)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.white.opacity(0.48))
                     .lineLimit(1)
@@ -304,7 +316,7 @@ struct ContentView: View {
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.48))
 
-                TextField("https://host/v1/usage", text: $endpoint)
+                TextField("https://host/v3/usage", text: $endpoint)
                     .textFieldStyle(.plain)
                     .font(.caption)
                     .padding(.horizontal, 11)
@@ -339,7 +351,7 @@ struct ContentView: View {
             }
 
             Label(
-                "The token and last reading stay inside the app's shared widget container.",
+                "The token stays in shared, non-syncing Keychain storage; only the endpoint and cached reading use the App Group.",
                 systemImage: "checkmark.shield"
             )
             .font(.caption2)
@@ -372,19 +384,20 @@ struct ContentView: View {
         }
     }
 
-    private var accountSummary: String {
-        guard let accounts = refreshState.snapshot?.accounts, !accounts.isEmpty else {
-            return "Claude + Codex in one glance"
+    private var poolSummary: String {
+        guard let pools = refreshState.snapshot?.pools, !pools.isEmpty else {
+            return "Claude + Codex + Grok in one glance"
         }
 
-        let claudeCount = accounts.count { $0.provider == .claude }
-        let codexCount = accounts.count { $0.provider == .codex }
-        let noun = accounts.count == 1 ? "account" : "accounts"
+        let claudeCount = pools.count { $0.provider == .claude }
+        let codexCount = pools.count { $0.provider == .codex }
+        let grokCount = pools.count { $0.provider == .grok }
+        let noun = pools.count == 1 ? "pool" : "pools"
 
-        if claudeCount > 0, codexCount > 0 {
-            return "\(accounts.count) \(noun) · \(claudeCount) Claude · \(codexCount) Codex"
+        if claudeCount > 0, codexCount > 0, grokCount > 0 {
+            return "\(pools.count) \(noun) · \(claudeCount) Claude · \(codexCount) Codex · \(grokCount) Grok"
         }
-        return "\(accounts.count) \(noun)"
+        return "\(pools.count) \(noun)"
     }
 
     private var connectionStatus: String {
@@ -399,7 +412,7 @@ struct ContentView: View {
     private func load() async {
         #if DEBUG
             if ProcessInfo.processInfo.arguments.contains("--sample-usage") {
-                now = Date()
+                let now = Date()
                 refreshState = .live(.sample(now: now))
                 return
             }
@@ -407,14 +420,20 @@ struct ContentView: View {
 
         guard let store else {
             refreshState = .failed(
-                message:
-                    "The shared App Group is unavailable. Check signing entitlements for the app and widget."
+                message: storeConfigurationError
+                    ?? "Shared app and widget storage is unavailable."
             )
             isConnectionExpanded = true
             return
         }
         endpoint = store.endpoint?.absoluteString ?? ""
-        token = store.token ?? ""
+        do {
+            token = try store.readToken() ?? ""
+        } catch {
+            refreshState = .failed(message: error.localizedDescription)
+            isConnectionExpanded = true
+            return
+        }
         isConnectionExpanded = store.endpoint == nil
         await refresh()
     }
@@ -429,8 +448,13 @@ struct ContentView: View {
             return
         }
 
+        do {
+            try store.saveToken(token)
+        } catch {
+            validationMessage = error.localizedDescription
+            return
+        }
         store.endpoint = url
-        store.token = token
         await refresh()
 
         if case .live = refreshState {
@@ -447,26 +471,16 @@ struct ContentView: View {
         guard let store else { return }
         isRefreshing = true
         defer { isRefreshing = false }
-        now = Date()
         refreshState = await store.refreshConfigured()
         WidgetCenter.shared.reloadAllTimelines()
     }
 
     private func validatedEndpoint() -> URL? {
-        guard let url = URL(string: endpoint),
-            let scheme = url.scheme?.lowercased(),
-            let host = url.host,
-            !host.isEmpty
-        else {
-            validationMessage = "Enter a complete HTTPS URL."
+        guard let url = URL(string: endpoint), UsageEndpointPolicy().allows(url) else {
+            validationMessage = "Enter a complete HTTPS URL (or loopback HTTP for development)."
             return nil
         }
-
-        if scheme == "https" { return url }
-        if scheme == "http", ["localhost", "127.0.0.1", "::1"].contains(host) { return url }
-
-        validationMessage = "Use HTTPS for any non-local usage feed."
-        return nil
+        return url
     }
 }
 

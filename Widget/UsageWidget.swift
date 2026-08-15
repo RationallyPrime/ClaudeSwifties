@@ -9,7 +9,7 @@ struct UsageEntry: TimelineEntry {
 }
 
 struct UsageTimelineProvider: TimelineProvider {
-    private let store = UsageStore.shared()
+    private let store = try? UsageStore.shared()
 
     func placeholder(in context: Context) -> UsageEntry {
         UsageEntry(date: Date(), snapshot: .sample(now: Date()))
@@ -17,7 +17,7 @@ struct UsageTimelineProvider: TimelineProvider {
 
     func getSnapshot(in context: Context, completion: @escaping (UsageEntry) -> Void) {
         let now = Date()
-        // The gallery preview must never depend on the tailnet being up.
+        // The gallery preview must never depend on the private feed being up.
         guard !context.isPreview else {
             completion(UsageEntry(date: now, snapshot: .sample(now: now)))
             return
@@ -50,20 +50,24 @@ private struct UsageWidgetView: View {
     let entry: UsageEntry
 
     var body: some View {
-        VStack(alignment: .leading, spacing: family == .systemMedium ? 5 : 10) {
-            header
-                .fixedSize(horizontal: false, vertical: true)
-                .layoutPriority(1)
+        TimelineView(.periodic(from: entry.date, by: 60)) { timeline in
+            VStack(alignment: .leading, spacing: family == .systemMedium ? 3 : 7) {
+                header
+                    .fixedSize(horizontal: false, vertical: true)
+                    .layoutPriority(1)
 
-            UsageSummaryView(
-                snapshot: entry.snapshot,
-                now: entry.date,
-                maxAccounts: family == .systemMedium ? 4 : 6,
-                style: family == .systemMedium ? .compact : .widgetGrid
-            )
-        }
-        .containerBackground(for: .widget) {
-            widgetBackground
+                UsageSummaryView(
+                    snapshot: entry.snapshot,
+                    now: timeline.date,
+                    maxPools: family == .systemMedium
+                        ? UsagePoolSelection.mediumCapacity
+                        : UsagePoolSelection.largeCapacity,
+                    style: family == .systemMedium ? .compact : .widgetGrid
+                )
+            }
+            .containerBackground(for: .widget) {
+                widgetBackground
+            }
         }
         .environment(\.colorScheme, .dark)
     }
@@ -90,8 +94,8 @@ private struct UsageWidgetView: View {
 
             Spacer()
 
-            if let count = entry.snapshot?.accounts.count {
-                Text("\(count) \(count == 1 ? "account" : "accounts")")
+            if let count = entry.snapshot?.pools.count {
+                Text("\(count) \(count == 1 ? "pool" : "pools")")
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.38))
             }
@@ -131,7 +135,7 @@ struct UsageWidget: Widget {
             UsageWidgetView(entry: entry)
         }
         .configurationDisplayName("AI usage")
-        .description("Claude and Codex limits with reset times.")
+        .description("Claude, Codex, and Grok quota pools with current profiles.")
         .supportedFamilies([.systemMedium, .systemLarge])
     }
 }

@@ -1,95 +1,121 @@
 import { describe, expect, test } from "bun:test";
 
-import { ValidationError, parseAccount } from "./contract.js";
+import { ValidationError, parseObservation } from "./contract.js";
+import { VALID_OBSERVATION } from "./test-fixtures.js";
 
-const valid = {
-  id: "rp-team",
-  label: "Team · rationallyprime",
-  source_host: "hetzner-cx53",
-  as_of: "2026-08-07T21:38:12.482Z",
-  status: "ok",
-  five_hour: { utilization: 0.42, resets_at: "2026-08-07T23:10:00Z" },
-  seven_day: null,
-};
-
-describe("parseAccount", () => {
-  test("accepts a well-formed push and normalises timestamps", () => {
-    const account = parseAccount(valid);
-    expect(account.id).toBe("rp-team");
-    expect(account.provider).toBe("claude");
-    expect(account.windows.map((window) => window.label)).toEqual(["5h"]);
-    expect(account.five_hour?.utilization).toBe(0.42);
-    expect(account.seven_day).toBeNull();
-    // Fractional seconds preserved through normalisation.
-    expect(account.as_of).toBe("2026-08-07T21:38:12.482Z");
+describe("parseObservation", () => {
+  test("accepts and normalises a complete schema-3 observation", () => {
+    const observation = parseObservation(VALID_OBSERVATION);
+    expect(observation.schema).toBe(3);
+    expect(observation.provider).toBe("claude");
+    expect(observation.observed_at).toBe("2026-08-15T15:30:00.000Z");
+    expect(observation.sampled_at).toBe("2026-08-15T15:29:58.123Z");
+    expect(observation.windows.map((window) => window.id)).toEqual([
+      "five-hour",
+      "seven-day",
+    ]);
   });
 
-  test("accepts a plain (non-fractional) timestamp from a different edge", () => {
-    const account = parseAccount({ ...valid, as_of: "2026-08-07T21:38:12Z" });
-    expect(account.as_of).toBe("2026-08-07T21:38:12.000Z");
-  });
-
-  /** The shim divides by 100; a raw percentage would silently render as 100%. */
-  test("rejects utilization sent as a percentage", () => {
-    expect(() => parseAccount({ ...valid, five_hour: { utilization: 42, resets_at: valid.five_hour.resets_at } }))
-      .toThrow(ValidationError);
-  });
-
-  test("rejects unknown status values", () => {
-    expect(() => parseAccount({ ...valid, status: "quota_hold" })).toThrow(ValidationError);
-  });
-
-  test("rejects ids that could escape their own namespace", () => {
-    expect(() => parseAccount({ ...valid, id: "../../etc/passwd" })).toThrow(ValidationError);
-    expect(() => parseAccount({ ...valid, id: "" })).toThrow(ValidationError);
-  });
-
-  test("rejects unparseable timestamps", () => {
-    expect(() => parseAccount({ ...valid, as_of: "yesterday" })).toThrow(ValidationError);
-    expect(() => parseAccount({ ...valid, as_of: "08/07/2026 21:38" })).toThrow(ValidationError);
-  });
-
-  test("accepts provider-defined Codex windows", () => {
-    const account = parseAccount({
-      id: "codex-pro",
-      label: "Codex · Pro",
-      provider: "codex",
-      source_host: "hakon-mbp",
-      as_of: "2026-08-08T00:20:00Z",
-      status: "ok",
-      windows: [
-        {
-          id: "primary-10080m",
-          label: "7d",
-          duration_minutes: 10_080,
-          utilization: 0.45,
-          resets_at: "2026-08-09T17:36:32Z",
-        },
-      ],
+  test("accepts all first-class providers and absent identity", () => {
+    const observation = parseObservation({
+      ...VALID_OBSERVATION,
+      provider: "grok",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      provider_client_version: null,
+      session_id: null,
+      windows: [],
+      status: "auth_expired",
     });
-
-    expect(account.provider).toBe("codex");
-    expect(account.windows[0]?.duration_minutes).toBe(10_080);
-    expect(account.seven_day?.utilization).toBe(0.45);
+    expect(observation.provider).toBe("grok");
+    expect(observation.provider_subject).toBeNull();
   });
 
-  test("rejects duplicate provider window ids", () => {
-    const window = {
-      id: "weekly",
-      label: "7d",
-      duration_minutes: 10_080,
-      utilization: 0.45,
-      resets_at: null,
-    };
-    expect(() => parseAccount({ ...valid, windows: [window, window] })).toThrow(/unique/);
+  test("accepts an explicit billing-unavailable degraded state", () => {
+    const observation = parseObservation({
+      ...VALID_OBSERVATION,
+      provider: "grok",
+      status: "billing_unavailable",
+      windows: [],
+    });
+    expect(observation.status).toBe("billing_unavailable");
   });
 
-  test("rejects oversized labels", () => {
-    expect(() => parseAccount({ ...valid, label: "x".repeat(200) })).toThrow(ValidationError);
+  test("rejects schema 1/2 instead of retaining a compatibility shim", () => {
+    expect(() => parseObservation({ ...VALID_OBSERVATION, schema: 2 })).toThrow(/schema must be 3/);
+    expect(() => parseObservation({ id: "old-account", schema: 1 })).toThrow(ValidationError);
   });
 
-  test("rejects non-objects", () => {
-    expect(() => parseAccount(null)).toThrow(ValidationError);
-    expect(() => parseAccount("nope")).toThrow(ValidationError);
+  test("fails closed on unknown top-level and nested secret-shaped fields", () => {
+    expect(() => parseObservation({ ...VALID_OBSERVATION, bearer_token: "secret" }))
+      .toThrow(/unknown field.*bearer_token/);
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      windows: [{ ...VALID_OBSERVATION.windows[0], oauth_token: "secret" }],
+    })).toThrow(/unknown field.*oauth_token/);
+  });
+
+  test("rejects control characters in every logged or displayed string", () => {
+    expect(() => parseObservation({ ...VALID_OBSERVATION, source_host: "host\nforged-log" }))
+      .toThrow(/control/);
+    expect(() => parseObservation({ ...VALID_OBSERVATION, profile_label: "Desktop\u001b[31m" }))
+      .toThrow(/control/);
+    expect(() => parseObservation({ ...VALID_OBSERVATION, pool_label: "   " }))
+      .toThrow(/1\.\.128/);
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      windows: [{ ...VALID_OBSERVATION.windows[0], label: "5h\rforged" }],
+    })).toThrow(/control/);
+  });
+
+  test("rejects raw percentages, non-finite values, and duplicate windows", () => {
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      windows: [{ ...VALID_OBSERVATION.windows[0], utilization: 58 }],
+    })).toThrow(/0\.\.1/);
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      windows: [{ ...VALID_OBSERVATION.windows[0], utilization: Number.NaN }],
+    })).toThrow(/finite/);
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      windows: [VALID_OBSERVATION.windows[0], VALID_OBSERVATION.windows[0]],
+    })).toThrow(/unique/);
+  });
+
+  test("rejects non-UUID observation ids and unsafe sequences", () => {
+    expect(() => parseObservation({ ...VALID_OBSERVATION, observation_id: "not-a-uuid" }))
+      .toThrow(/UUID/);
+    expect(() => parseObservation({ ...VALID_OBSERVATION, sequence: -1 }))
+      .toThrow(/non-negative/);
+    expect(() => parseObservation({ ...VALID_OBSERVATION, sequence: Number.MAX_SAFE_INTEGER + 1 }))
+      .toThrow(/safe integer/);
+  });
+
+  test("requires UTC instants and a valid identity evidence pairing", () => {
+    expect(() => parseObservation({ ...VALID_OBSERVATION, sampled_at: "2026-08-15T15:30:00+00:00" }))
+      .toThrow(/UTC instant/);
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      provider_subject: null,
+      identity_evidence: "email",
+    })).toThrow(/must be unknown/);
+  });
+
+  test("rejects calendar-impossible UTC instants instead of normalising them", () => {
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      sampled_at: "2026-02-31T15:30:00Z",
+    })).toThrow(/valid timestamp/);
+    expect(() => parseObservation({
+      ...VALID_OBSERVATION,
+      observed_at: "2026-08-15T24:00:00Z",
+    })).toThrow(/valid timestamp/);
+  });
+
+  test("requires every contract field rather than guessing defaults", () => {
+    const missing = { ...VALID_OBSERVATION } as Record<string, unknown>;
+    delete missing.sample_time_quality;
+    expect(() => parseObservation(missing)).toThrow(ValidationError);
   });
 });

@@ -1,6 +1,6 @@
 import Foundation
 
-/// How much to trust a number given how long ago the edge read it.
+/// How much to trust a number given how long ago the provider sampled it.
 public enum Freshness: Sendable, Equatable {
     case fresh
     case aging
@@ -16,31 +16,51 @@ public struct FreshnessPolicy: Sendable, Equatable {
         self.agingWithin = agingWithin
     }
 
-    /// The widget asks for a refresh every 15 minutes, though WidgetKit remains
-    /// free to coalesce that schedule. Older readings stay visible but dim.
     public static let `default` = FreshnessPolicy(freshWithin: 15 * 60, agingWithin: 60 * 60)
 }
 
-/// What a tile should actually render. Collapses the edge-reported status and
-/// the locally-computed age into one value, so the view never has to decide
-/// whether a stale `.ok` outranks a fresh `.error`.
-public enum TileState: Sendable, Equatable {
+public struct ProfileActivityPolicy: Sendable, Equatable {
+    public var currentWithin: TimeInterval
+    public var recentWithin: TimeInterval
+
+    public init(currentWithin: TimeInterval, recentWithin: TimeInterval) {
+        self.currentWithin = currentWithin
+        self.recentWithin = recentWithin
+    }
+
+    public static let `default` = ProfileActivityPolicy(
+        currentWithin: 15 * 60,
+        recentWithin: 24 * 60 * 60
+    )
+}
+
+/// A pool can be degraded while retaining a trustworthy last-good reading.
+/// The UI therefore separates availability from whether numbers may render.
+public enum PoolTileState: Sendable, Equatable {
     case live(Freshness)
-    case authExpired
-    case error
-    case unknown
+    case degraded(Freshness, PoolStatus)
+    case unavailable(PoolStatus)
 
     public var showsNumbers: Bool {
         switch self {
-        case .live: true
-        case .authExpired, .error, .unknown: false
+        case .live, .degraded: true
+        case .unavailable: false
+        }
+    }
+
+    public var freshness: Freshness? {
+        switch self {
+        case .live(let freshness), .degraded(let freshness, _): freshness
+        case .unavailable: nil
         }
     }
 }
 
-extension AccountUsage {
+extension UsagePool {
+    /// Honest age uses provider sample time. Server receipt and snapshot
+    /// generation times do not make an old terminal reading fresh again.
     public func age(now: Date) -> TimeInterval {
-        max(0, now.timeIntervalSince(asOf))
+        max(0, now.timeIntervalSince(sampledAt))
     }
 
     public func freshness(now: Date, policy: FreshnessPolicy = .default) -> Freshness {
@@ -50,20 +70,50 @@ extension AccountUsage {
         return .stale
     }
 
-    public func tileState(now: Date, policy: FreshnessPolicy = .default) -> TileState {
+    public func tileState(now: Date, policy: FreshnessPolicy = .default) -> PoolTileState {
+        let clockFreshness = freshness(now: now, policy: policy)
         switch status {
-        case .authExpired: .authExpired
-        case .error: .error
-        case .unknown: .unknown
-        case .ok, .stale:
-            if status == .stale {
-                // A `.stale` edge report can only ever be worse than the clock
-                // says, never better, so take the pessimistic reading of the two.
-                .live(max(freshness(now: now, policy: policy), .aging))
-            } else {
-                .live(freshness(now: now, policy: policy))
-            }
+        case .ok:
+            return .live(clockFreshness)
+        case .stale:
+            return .live(max(clockFreshness, .aging))
+        case .authExpired, .billingUnavailable, .error, .unknown:
+            guard !windows.isEmpty else { return .unavailable(status) }
+            return .degraded(max(clockFreshness, .aging), status)
         }
+    }
+}
+
+extension ObserverProfile {
+    /// A cached snapshot cannot keep a profile "current" forever. The client
+    /// advances server state pessimistically from the heartbeat timestamp.
+    public func effectiveState(
+        now: Date,
+        policy: ProfileActivityPolicy = .default
+    ) -> ObserverProfileState {
+        let age = max(0, now.timeIntervalSince(lastSeenAt))
+        let clockState: ObserverProfileState
+        if age <= policy.currentWithin {
+            clockState = .current
+        } else if age <= policy.recentWithin {
+            clockState = .recent
+        } else {
+            clockState = .stale
+        }
+
+        switch state {
+        case .current: return clockState
+        case .recent: return clockState == .stale ? .stale : .recent
+        case .stale: return .stale
+        case .unknown: return .unknown
+        }
+    }
+}
+
+extension UsagePool {
+    /// Server order is preserved while cached heartbeat state progresses.
+    public func currentProfiles(now: Date) -> [ObserverProfile] {
+        profiles.filter { $0.effectiveState(now: now) == .current }
     }
 }
 

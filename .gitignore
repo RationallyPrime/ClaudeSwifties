@@ -18,6 +18,7 @@ aggregator/.env
 # Python collector
 __pycache__/
 *.py[cod]
+.ruff_cache/
 
 # macOS
 .DS_Store

@@ -6,5 +6,9 @@
     <array>
         <string>group.is.sokrates.claudeswifties</string>
     </array>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)is.sokrates.ClaudeSwifties.shared</string>
+    </array>
 </dict>
 </plist>

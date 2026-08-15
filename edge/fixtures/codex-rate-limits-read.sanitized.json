@@ -1,0 +1,61 @@
+{
+  "rateLimitResetCredits": {
+    "availableCount": 0,
+    "credits": []
+  },
+  "rateLimits": {
+    "credits": {
+      "balance": "100.00",
+      "hasCredits": true,
+      "unlimited": false
+    },
+    "individualLimit": null,
+    "limitId": "codex",
+    "limitName": null,
+    "planType": "pro",
+    "primary": {
+      "usedPercent": 45,
+      "windowDurationMins": 10080,
+      "resetsAt": 1786900000
+    },
+    "rateLimitReachedType": null,
+    "secondary": null,
+    "spendControlReached": false
+  },
+  "rateLimitsByLimitId": {
+    "codex": {
+      "credits": {
+        "balance": "100.00",
+        "hasCredits": true,
+        "unlimited": false
+      },
+      "individualLimit": null,
+      "limitId": "codex",
+      "limitName": null,
+      "planType": "pro",
+      "primary": {
+        "usedPercent": 45,
+        "windowDurationMins": 10080,
+        "resetsAt": 1786900000
+      },
+      "rateLimitReachedType": null,
+      "secondary": null,
+      "spendControlReached": false
+    },
+    "provider-defined-secondary": {
+      "credits": null,
+      "individualLimit": null,
+      "limitId": "provider-defined-secondary",
+      "limitName": "Additional provider bucket",
+      "planType": "pro",
+      "primary": {
+        "usedPercent": 91,
+        "windowDurationMins": 1440,
+        "resetsAt": 1786900000
+      },
+      "rateLimitReachedType": null,
+      "secondary": null,
+      "spendControlReached": null
+    }
+  }
+}
