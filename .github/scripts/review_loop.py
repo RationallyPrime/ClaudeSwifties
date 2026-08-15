@@ -535,16 +535,86 @@ def result_heads_from_events(
     return heads
 
 
+def _kind_tiebreak(kind: str) -> int:
+    """Findings beat CLEAN when GitHub timestamps collide at one-second precision.
+
+    ``codex_result_events`` assigns clean comments a larger ``order`` only
+    because it iterates comments after reviews. That is collection order, not
+    chronology, so a same-second CLEAN must not suppress standing findings.
+    """
+    return 1 if kind == "findings" else 0
+
+
 def latest_result_kind_by_head(
     events: Sequence[tuple[datetime, int, str, str]],
 ) -> dict[str, str]:
-    """Later of findings-review vs clean-comment for each head."""
-    latest: dict[str, tuple[datetime, int, str]] = {}
+    """Later of findings-review vs clean-comment for each head.
+
+    Timestamp ties prefer findings: GitHub stamps have one-second precision
+    and clean comments are collected after reviews, so ``order`` is not
+    chronology across channels.
+    """
+    latest: dict[str, tuple[datetime, int, int, str]] = {}
     for at, order, head, kind in events:
+        candidate = (at, _kind_tiebreak(kind), order, kind)
         previous = latest.get(head)
-        if previous is None or (at, order) >= (previous[0], previous[1]):
-            latest[head] = (at, order, kind)
-    return {head: kind for head, (_, _, kind) in latest.items()}
+        if previous is None or candidate[:3] >= previous[:3]:
+            latest[head] = candidate
+    return {head: kind for head, (_, _, _, kind) in latest.items()}
+
+
+def latest_head_verdict(
+    events: Sequence[tuple[datetime, int, str, str]],
+    head_sha: str,
+) -> tuple[datetime, str] | None:
+    """Latest dated exact-head verdict as ``(time, kind)``.
+
+    Undated events cannot anchor a redelivery window. Timestamp ties prefer
+    findings so a same-second CLEAN comment cannot suppress standing inlines.
+    """
+    wanted = head_sha.lower()
+    undated = datetime.min.replace(tzinfo=timezone.utc)
+    latest: tuple[datetime, int, int, str] | None = None
+    for at, order, event_head, kind in events:
+        if event_head.lower() != wanted or at == undated:
+            continue
+        candidate = (at, _kind_tiebreak(kind), order, kind)
+        if latest is None or candidate[:3] >= latest[:3]:
+            latest = candidate
+    if latest is None:
+        return None
+    return latest[0], latest[3]
+
+
+def findings_reviews_after_clean(
+    events: Sequence[tuple[datetime, int, str, str]],
+    reviews: Sequence[Mapping[str, Any]],
+    head_sha: str,
+    codex_login: str,
+) -> list[Mapping[str, Any]]:
+    """Exact-head findings reviews that are not older than the latest CLEAN.
+
+    A CLEAN supersedes earlier inlines on the same unchanged head. Later
+    findings reviews are a new standing set and are unioned: a re-review's
+    inline set can be disjoint from the previous one. Same-second reviews
+    are kept — findings win timestamp ties.
+    """
+    wanted = head_sha.lower()
+    undated = datetime.min.replace(tzinfo=timezone.utc)
+    latest_clean_at: datetime | None = None
+    for at, _order, event_head, kind in events:
+        if event_head.lower() != wanted or kind != "clean" or at == undated:
+            continue
+        if latest_clean_at is None or at > latest_clean_at:
+            latest_clean_at = at
+    exact = exact_head_codex_reviews(reviews, head_sha, codex_login)
+    if latest_clean_at is None:
+        return exact
+    return [
+        review
+        for review in exact
+        if result_event_time(review.get("submitted_at")) >= latest_clean_at
+    ]
 
 
 def codex_result_heads(
@@ -1489,6 +1559,8 @@ def standing_verdict_time(
     comments: Sequence[Mapping[str, Any]],
     head_sha: str,
     codex_login: str,
+    *,
+    events: Sequence[tuple[datetime, int, str, str]] | None = None,
 ) -> datetime | None:
     """When Codex last published a verdict for this exact head.
 
@@ -1496,19 +1568,14 @@ def standing_verdict_time(
     clean comment's ``created_at``.  The *latest* is the anchor — the window
     measures how long the current verdict has stood unacted, so a re-review
     restarts it rather than inheriting the first delivery's age.
+
+    Pass a previously resolved ``events`` list from ``codex_result_events``
+    so a scheduled scan does not re-resolve short CLEAN SHAs.
     """
-    stamps: list[datetime] = []
-    for review in exact_head_codex_reviews(reviews, head_sha, codex_login):
-        submitted = str(review.get("submitted_at") or "").strip()
-        if submitted:
-            stamps.append(parse_github_time(submitted))
-    for comment in comments:
-        created = str(comment.get("created_at") or "").strip()
-        if not created:
-            continue
-        if clean_comment_head(github, comment, codex_login) == head_sha.lower():
-            stamps.append(parse_github_time(created))
-    return max(stamps) if stamps else None
+    if events is None:
+        events = codex_result_events(github, reviews, comments, codex_login)
+    verdict = latest_head_verdict(events, head_sha)
+    return None if verdict is None else verdict[0]
 
 
 def standing_verdict_kind(
@@ -1517,25 +1584,23 @@ def standing_verdict_kind(
     comments: Sequence[Mapping[str, Any]],
     head_sha: str,
     codex_login: str,
+    *,
+    events: Sequence[tuple[datetime, int, str, str]] | None = None,
 ) -> str | None:
     """Latest exact-head verdict kind: ``findings`` or ``clean``.
 
-    ``standing_verdict_time`` already anchors on the later channel.  A later
-    CLEAN on an unchanged head supersedes earlier findings — the same rule
-    ``round_history`` applies — so redelivery must not union those obsolete
-    inline comments back into a Talos burn.
+    A later CLEAN on an unchanged head supersedes earlier findings — the same
+    rule ``round_history`` applies — so redelivery must not union those
+    obsolete inline comments back into a Talos burn. Timestamp ties prefer
+    findings: collection order is not chronology across channels.
+
+    Pass a previously resolved ``events`` list from ``codex_result_events``
+    so a scheduled scan does not re-resolve short CLEAN SHAs.
     """
-    wanted = head_sha.lower()
-    latest: tuple[datetime, int, str] | None = None
-    for at, order, event_head, kind in codex_result_events(
-        github, reviews, comments, codex_login
-    ):
-        if event_head.lower() != wanted:
-            continue
-        candidate = (at, order, kind)
-        if latest is None or candidate[:2] >= latest[:2]:
-            latest = candidate
-    return None if latest is None else latest[2]
+    if events is None:
+        events = codex_result_events(github, reviews, comments, codex_login)
+    verdict = latest_head_verdict(events, head_sha)
+    return None if verdict is None else verdict[1]
 
 
 def standing_findings(
@@ -1544,19 +1609,16 @@ def standing_findings(
     reviews: Sequence[Mapping[str, Any]],
     codex_login: str,
 ) -> list[dict[str, Any]]:
-    """Every inline finding still standing on one unchanged head.
+    """Inline findings belonging to the supplied reviews.
 
-    Reading only the newest review undercounts: a re-review of unchanged bytes
-    emits a second review whose inline set can be disjoint from the first.  On a
-    head that has not moved, nothing has resolved either set — only a push
-    resolves a finding, and a push changes the head — so the standing set is the
-    union.  Each inline comment belongs to exactly one review, so the union is a
-    concatenation with no deduplication to do.  The comment list is fetched once
-    and filtered per review, matching ``review_findings``'s contract.
-
-    A later CLEAN on the same unchanged head is a different verdict, not a
-    second findings set.  Callers that redeliver a standing wake must select
-    by latest verdict kind before invoking this union.
+    The caller chooses the review set.  Redelivery passes only findings
+    reviews that postdate the latest same-head CLEAN: earlier inlines were
+    superseded.  Several findings reviews after that CLEAN are unioned — a
+    re-review's inline set can be disjoint, and on an unchanged head nothing
+    has resolved either set.  Each inline comment belongs to exactly one
+    review, so the union is a concatenation with no deduplication.  The
+    comment list is fetched once and filtered per review, matching
+    ``review_findings``'s contract.
     """
     review_comments = list(github.paginate(f"pulls/{pr_number}/comments"))
     findings: list[dict[str, Any]] = []
@@ -1579,6 +1641,7 @@ def redeliver_standing_wake(
     repository: str,
     codex_login: str,
     now: datetime,
+    result_events: Sequence[tuple[datetime, int, str, str]] | None = None,
 ) -> bool:
     """Re-deliver one standing verdict for an already-reviewed head.
 
@@ -1601,29 +1664,39 @@ def redeliver_standing_wake(
     if marker_comment_exists(comments, redelivery_marker(head_sha)):
         return False
 
-    verdict_at = standing_verdict_time(github, reviews, comments, head_sha, codex_login)
-    if verdict_at is None:
+    events = (
+        list(result_events)
+        if result_events is not None
+        else codex_result_events(github, reviews, comments, codex_login)
+    )
+    verdict = latest_head_verdict(events, head_sha)
+    if verdict is None:
         print(
             f"no timestamped Codex verdict for {repository}#{pr_number} "
             f"(head={head_sha}); nothing to re-deliver"
         )
         return False
+    verdict_at, latest_kind = verdict
     if (now - verdict_at).total_seconds() < WAKE_REDELIVERY_SECONDS:
         return False
     verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     exact_reviews = exact_head_codex_reviews(reviews, head_sha, codex_login)
-    latest_kind = standing_verdict_kind(
-        github, reviews, comments, head_sha, codex_login
-    )
     # No exact-head review means the verdict came from a clean comment, which
     # carries no inline findings by construction — so this costs no API call.
-    # A later CLEAN on an unchanged head likewise supersedes earlier findings.
-    findings = (
-        standing_findings(github, pr_number, exact_reviews, codex_login)
-        if exact_reviews and latest_kind != "clean"
-        else []
-    )
+    # A later CLEAN on an unchanged head supersedes earlier findings: only
+    # reviews at or after that CLEAN are unioned.
+    if latest_kind == "clean" or not exact_reviews:
+        findings = []
+    else:
+        standing_reviews = findings_reviews_after_clean(
+            events, reviews, head_sha, codex_login
+        )
+        findings = (
+            standing_findings(github, pr_number, standing_reviews, codex_login)
+            if standing_reviews
+            else []
+        )
     listed_labels = {
         str(label.get("name"))
         for label in pull_request.get("labels", [])
@@ -1752,7 +1825,8 @@ def nudge_stalled_reviews() -> None:
         reviews = github.paginate(f"pulls/{pr_number}/reviews")
         head_sha = str(head["sha"])
         comments = github.paginate(f"issues/{pr_number}/comments")
-        reviewed_heads = codex_result_heads(github, reviews, comments, codex_login)
+        result_events = codex_result_events(github, reviews, comments, codex_login)
+        reviewed_heads = result_heads_from_events(result_events)
         if head_sha in reviewed_heads:
             # A reviewed head needs no reviewer, but its verdict may still be
             # standing unacted. The commit-age gate above is already satisfied
@@ -1770,6 +1844,7 @@ def nudge_stalled_reviews() -> None:
                 repository=repository,
                 codex_login=codex_login,
                 now=now,
+                result_events=result_events,
             ):
                 redelivered += 1
             continue
