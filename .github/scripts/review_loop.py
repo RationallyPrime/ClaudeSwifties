@@ -1511,6 +1511,33 @@ def standing_verdict_time(
     return max(stamps) if stamps else None
 
 
+def standing_verdict_kind(
+    github: GitHubApi,
+    reviews: Sequence[Mapping[str, Any]],
+    comments: Sequence[Mapping[str, Any]],
+    head_sha: str,
+    codex_login: str,
+) -> str | None:
+    """Latest exact-head verdict kind: ``findings`` or ``clean``.
+
+    ``standing_verdict_time`` already anchors on the later channel.  A later
+    CLEAN on an unchanged head supersedes earlier findings — the same rule
+    ``round_history`` applies — so redelivery must not union those obsolete
+    inline comments back into a Talos burn.
+    """
+    wanted = head_sha.lower()
+    latest: tuple[datetime, int, str] | None = None
+    for at, order, event_head, kind in codex_result_events(
+        github, reviews, comments, codex_login
+    ):
+        if event_head.lower() != wanted:
+            continue
+        candidate = (at, order, kind)
+        if latest is None or candidate[:2] >= latest[:2]:
+            latest = candidate
+    return None if latest is None else latest[2]
+
+
 def standing_findings(
     github: GitHubApi,
     pr_number: int,
@@ -1526,6 +1553,10 @@ def standing_findings(
     union.  Each inline comment belongs to exactly one review, so the union is a
     concatenation with no deduplication to do.  The comment list is fetched once
     and filtered per review, matching ``review_findings``'s contract.
+
+    A later CLEAN on the same unchanged head is a different verdict, not a
+    second findings set.  Callers that redeliver a standing wake must select
+    by latest verdict kind before invoking this union.
     """
     review_comments = list(github.paginate(f"pulls/{pr_number}/comments"))
     findings: list[dict[str, Any]] = []
@@ -1582,11 +1613,15 @@ def redeliver_standing_wake(
     verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     exact_reviews = exact_head_codex_reviews(reviews, head_sha, codex_login)
+    latest_kind = standing_verdict_kind(
+        github, reviews, comments, head_sha, codex_login
+    )
     # No exact-head review means the verdict came from a clean comment, which
     # carries no inline findings by construction — so this costs no API call.
+    # A later CLEAN on an unchanged head likewise supersedes earlier findings.
     findings = (
         standing_findings(github, pr_number, exact_reviews, codex_login)
-        if exact_reviews
+        if exact_reviews and latest_kind != "clean"
         else []
     )
     listed_labels = {
@@ -1661,9 +1696,9 @@ def redeliver_standing_wake(
                 head_sha=head_sha,
                 review_round=review_round,
                 review_state=(
-                    str(exact_reviews[-1].get("state") or "unknown")
-                    if exact_reviews
-                    else "clean-comment"
+                    "clean-comment"
+                    if latest_kind == "clean" or not exact_reviews
+                    else str(exact_reviews[-1].get("state") or "unknown")
                 ),
                 word=word,
                 pr_url=pr_url,
