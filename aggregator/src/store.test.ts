@@ -717,6 +717,61 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("legacy import does not consume the live collector sequence namespace", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-v3-legacy-sequence-"));
+    await writeFile(join(dir, "usage.json"), JSON.stringify([
+      {
+        account: {
+          id: "desktop-a",
+          label: "Claude · Desktop",
+          provider: "claude",
+          source_host: "old-edge",
+          as_of: "2026-08-15T15:00:00Z",
+          status: "ok",
+          windows: windows(0.4),
+        },
+        received_at: "2026-08-15T15:00:01Z",
+      },
+      {
+        account: {
+          id: "desktop-b",
+          label: "Claude · Other",
+          provider: "claude",
+          source_host: "old-edge",
+          as_of: "2026-08-15T15:00:00Z",
+          status: "ok",
+          windows: windows(0.5),
+        },
+        received_at: "2026-08-15T15:00:01Z",
+      },
+    ]), "utf8");
+
+    const store = await openStore(dir);
+    const first = store.ingest(observation({
+      profile_id: "desktop-a",
+      sequence: 0,
+      sampled_at: "2026-08-15T15:01:00Z",
+      observed_at: "2026-08-15T15:01:01Z",
+      windows: windows(0.41),
+    }), "2026-08-15T15:01:02Z");
+    const second = store.ingest(observation({
+      profile_id: "desktop-b",
+      sequence: 0,
+      sampled_at: "2026-08-15T15:01:00Z",
+      observed_at: "2026-08-15T15:01:01Z",
+      windows: windows(0.51),
+    }), "2026-08-15T15:01:02Z");
+
+    expect(first.outcome).toBe("accepted");
+    expect(second.outcome).toBe("accepted");
+    const db = new Database(join(dir, "usage-v3.sqlite"));
+    expect(db.query<{ count: number }, []>(
+      "SELECT COUNT(*) AS count FROM profile_sequences WHERE edge_id = 'legacy-import'",
+    ).get()?.count).toBe(0);
+    db.close();
+    store.close();
+  });
+
   test("first live subject promotes a unique exact-continuity schema-2 import", async () => {
     const dir = await mkdtemp(join(tmpdir(), "usage-v3-promote-import-"));
     await writeFile(join(dir, "usage.json"), JSON.stringify([{

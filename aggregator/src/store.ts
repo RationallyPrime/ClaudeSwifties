@@ -215,7 +215,9 @@ export class UsageStore {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const { observation, receivedAt } of items) {
-        this.ingestTransaction(observation, new Date(receivedAt).toISOString());
+        this.ingestTransaction(observation, new Date(receivedAt).toISOString(), {
+          consumeSequence: false,
+        });
       }
       this.db.query("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)")
         .run("legacy_import_completed", "1");
@@ -430,7 +432,12 @@ export class UsageStore {
     }
   }
 
-  private ingestTransaction(original: UsageObservation, receivedAt: string): IngestResult {
+  private ingestTransaction(
+    original: UsageObservation,
+    receivedAt: string,
+    options: { consumeSequence?: boolean } = {},
+  ): IngestResult {
+    const consumeSequence = options.consumeSequence !== false;
     const duplicate = this.db.query<{ id: string; clock_skewed: number }, [string]>(
       "SELECT id, clock_skewed FROM observations WHERE id = ?",
     ).get(original.observation_id);
@@ -448,7 +455,7 @@ export class UsageStore {
       "SELECT edge_id, last_sequence FROM profile_sequences WHERE profile_id = ?",
     ).get(observation.profile_id);
 
-    if (sequence && observation.sequence <= sequence.last_sequence) {
+    if (consumeSequence && sequence && observation.sequence <= sequence.last_sequence) {
       this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
       return {
         observation_id: observation.observation_id,
@@ -457,13 +464,15 @@ export class UsageStore {
       };
     }
 
-    this.db.query(`
-      INSERT INTO profile_sequences (profile_id, edge_id, last_sequence)
-      VALUES (?, ?, ?)
-      ON CONFLICT(profile_id) DO UPDATE SET
-        edge_id = excluded.edge_id,
-        last_sequence = excluded.last_sequence
-    `).run(observation.profile_id, observation.edge_id, observation.sequence);
+    if (consumeSequence) {
+      this.db.query(`
+        INSERT INTO profile_sequences (profile_id, edge_id, last_sequence)
+        VALUES (?, ?, ?)
+        ON CONFLICT(profile_id) DO UPDATE SET
+          edge_id = excluded.edge_id,
+          last_sequence = excluded.last_sequence
+      `).run(observation.profile_id, observation.edge_id, observation.sequence);
+    }
 
     const existingBinding = this.db.query<BindingRow, [string, string]>(`
       SELECT profile_id, session_key, provider, pool_id, label, source_host,
