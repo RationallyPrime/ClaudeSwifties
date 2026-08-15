@@ -581,6 +581,44 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("higher-quality equal-time sample upgrades projection metadata", async () => {
+    const { dir, store } = await freshStore();
+    store.ingest(observation({
+      sequence: 1,
+      pool_label: "Claude · Approximate",
+      sample_time_quality: "sensor_time",
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z");
+    const result = store.ingest(observation({
+      sequence: 2,
+      pool_label: "Claude · Provider confirmed",
+      sample_time_quality: "provider_time",
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:02Z");
+
+    expect(result.outcome).toBe("accepted");
+    const pool = store.snapshot("2026-08-15T15:31:00Z").pools[0];
+    expect(pool?.label).toBe("Claude · Provider confirmed");
+    expect(pool?.windows[0]?.utilization).toBe(0.5);
+    expect(pool?.received_at).toBe("2026-08-15T15:30:02.000Z");
+    const intermediate = store.ingest(observation({
+      sequence: 3,
+      pool_label: "must-not-replace-provider-truth",
+      sample_time_quality: "transcript_mtime",
+      windows: windows(0.6),
+    }), "2026-08-15T15:30:03Z");
+    expect(intermediate.outcome).toBe("ignored");
+    expect(store.snapshot("2026-08-15T15:31:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.5);
+    store.close();
+
+    const db = new Database(join(dir, "usage-v3.sqlite"));
+    expect(db.query<{ sample_quality: string }, []>(
+      "SELECT sample_quality FROM pools",
+    ).get()?.sample_quality).toBe("provider_time");
+    db.close();
+  });
+
   test("billing unavailable updates status while preserving Grok's last good windows", async () => {
     const { store } = await freshStore();
     store.ingest(observation({
@@ -898,19 +936,56 @@ describe("UsageStore schema-3 reconciliation", () => {
         PRIMARY KEY (profile_id, session_key)
       );
       CREATE INDEX bindings_by_pool ON bindings(pool_id);
+      INSERT INTO pools VALUES (
+        'legacy-pool', 'claude', NULL, 'Claude · Legacy', 'provisional', 'ok',
+        '2026-08-15T15:00:00.000Z', '2026-08-15T15:00:01.000Z',
+        'unknown', '[]', '2026-08-15T15:00:01.000Z', 0
+      );
+      INSERT INTO bindings VALUES (
+        'legacy-profile', '__profile__', 'claude', 'legacy-pool',
+        'Legacy profile', 'legacy-host', '2026-08-15T15:00:00.000Z', 'provisional'
+      );
+      CREATE TABLE latest_session_observations (
+        profile_id TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        observation_id TEXT NOT NULL UNIQUE,
+        sequence INTEGER NOT NULL,
+        pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE RESTRICT,
+        outcome TEXT NOT NULL,
+        sampled_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        PRIMARY KEY (profile_id, session_key)
+      );
+      INSERT INTO latest_session_observations VALUES (
+        'legacy-profile', '__profile__', '018f47f0-167a-7cc4-a3d1-d6f5eb04c4f3',
+        7, 'legacy-pool', 'accepted', '2026-08-15T15:00:00.000Z',
+        '2026-08-15T15:00:01.000Z', '{}'
+      );
       PRAGMA user_version = 3;
     `);
     old.close();
 
     const store = await openStore(dir);
+    expect(store.latestSessionObservationId("legacy-profile", null))
+      .toBe("018f47f0-167a-7cc4-a3d1-d6f5eb04c4f3");
+    expect(store.snapshot("2026-08-15T15:01:00Z").pools[0]?.id).toBe("legacy-pool");
     store.ingest(observation({
       provider: "grok",
       status: "billing_unavailable",
       windows: [],
     }), "2026-08-15T15:30:01Z");
-    expect(store.snapshot("2026-08-15T15:31:00Z").pools[0]?.status)
+    expect(store.snapshot("2026-08-15T15:31:00Z").pools
+      .find((pool) => pool.provider === "grok")?.status)
       .toBe("billing_unavailable");
     store.close();
+
+    const migrated = new Database(dbPath);
+    expect(migrated.query<{ table: string }, []>(
+      "PRAGMA foreign_key_list('latest_session_observations')",
+    ).all().map((row) => row.table)).toEqual(["pools"]);
+    expect(migrated.query<unknown, []>("PRAGMA foreign_key_check").all()).toEqual([]);
+    migrated.close();
   });
 
   test("corrupt legacy state terminalizes visibly instead of silently booting empty", async () => {
@@ -940,6 +1015,59 @@ describe("UsageStore schema-3 reconciliation", () => {
     expect(db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pools").get()?.count)
       .toBe(0);
     db.close();
+  });
+
+  test("rejects an unsupported explicit legacy provider before importing anything", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-v3-provider-corrupt-"));
+    const legacyPath = join(dir, "usage.json");
+    await writeFile(legacyPath, JSON.stringify([{
+      account: {
+        id: "mystery-account",
+        label: "Mystery",
+        provider: "unknown",
+        source_host: "edge",
+        as_of: "2026-08-15T15:00:00Z",
+        status: "ok",
+        windows: windows(0.4),
+      },
+    }]), "utf8");
+
+    await expect(openStore(dir)).rejects.toThrow(/account\.provider must be claude, codex, or grok/);
+    const db = new Database(join(dir, "usage-v3.sqlite"));
+    expect(db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM pools").get()?.count)
+      .toBe(0);
+    expect(db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM metadata").get()?.count)
+      .toBe(0);
+    db.close();
+    expect((await stat(legacyPath)).isFile()).toBeTrue();
+  });
+
+  test("infers legacy provider only when the provider field is absent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-v3-provider-inference-"));
+    const legacyAccount = (id: string) => ({
+      account: {
+        id,
+        label: id,
+        source_host: "edge",
+        as_of: "2026-08-15T15:00:00Z",
+        status: "ok",
+        windows: windows(0.4),
+      },
+    });
+    await writeFile(
+      join(dir, "usage.json"),
+      JSON.stringify([legacyAccount("codex-work"), legacyAccount("team-claude")]),
+      "utf8",
+    );
+
+    const store = await openStore(dir);
+    const providers = new Map(store.snapshot("2026-08-15T15:01:00Z").pools.map((pool) => [
+      pool.profiles[0]?.id,
+      pool.provider,
+    ]));
+    expect(providers.get("codex-work")).toBe("codex");
+    expect(providers.get("team-claude")).toBe("claude");
+    store.close();
   });
 
   test("rolls back the complete legacy batch when capacity cannot admit it", async () => {

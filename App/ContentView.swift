@@ -426,7 +426,8 @@ struct ContentView: View {
             isConnectionExpanded = true
             return
         }
-        endpoint = store.endpoint?.absoluteString ?? ""
+        let configuredEndpoint = store.endpoint
+        endpoint = configuredEndpoint?.absoluteString ?? ""
         do {
             token = try store.readToken() ?? ""
         } catch {
@@ -434,7 +435,9 @@ struct ContentView: View {
             isConnectionExpanded = true
             return
         }
-        isConnectionExpanded = store.endpoint == nil
+        isConnectionExpanded = configuredEndpoint.map {
+            !UsageEndpointPolicy().allows($0)
+        } ?? true
         await refresh()
     }
 
@@ -477,7 +480,7 @@ struct ContentView: View {
 
     private func validatedEndpoint() -> URL? {
         guard let url = URL(string: endpoint), UsageEndpointPolicy().allows(url) else {
-            validationMessage = "Enter a complete HTTPS URL (or loopback HTTP for development)."
+            validationMessage = "Enter the HTTPS /v3/usage URL (or loopback HTTP for development)."
             return nil
         }
         return url

@@ -337,14 +337,23 @@ export class UsageStore {
 
   /**
    * Early schema-3 candidates allowed only four statuses. SQLite cannot alter
-   * a CHECK constraint in place, so rebuild the two related tables without
-   * losing pool order, bindings, or foreign-key integrity.
+   * a CHECK constraint in place, so rebuild the pool and every dependent table
+   * without losing order, bindings, latest-session state, or FK integrity.
    */
   private migrateStatusConstraint(): void {
+    const hasLatestSessionObservations = Boolean(this.db.query<{ present: number }, [string]>(`
+      SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?
+    `).get("latest_session_observations"));
     this.db.exec("PRAGMA foreign_keys = OFF");
     try {
+      this.db.exec("BEGIN IMMEDIATE");
+      if (hasLatestSessionObservations) {
+        this.db.exec(`
+          ALTER TABLE latest_session_observations
+          RENAME TO latest_session_observations_status_v3;
+        `);
+      }
       this.db.exec(`
-        BEGIN IMMEDIATE;
         ALTER TABLE bindings RENAME TO bindings_status_v3;
         ALTER TABLE pools RENAME TO pools_status_v3;
 
@@ -376,15 +385,39 @@ export class UsageStore {
           PRIMARY KEY (profile_id, session_key)
         );
         INSERT INTO bindings SELECT * FROM bindings_status_v3;
-
+      `);
+      if (hasLatestSessionObservations) {
+        this.db.exec(`
+          CREATE TABLE latest_session_observations (
+            profile_id TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            observation_id TEXT NOT NULL UNIQUE,
+            sequence INTEGER NOT NULL,
+            pool_id TEXT NOT NULL REFERENCES pools(id) ON DELETE RESTRICT,
+            outcome TEXT NOT NULL,
+            sampled_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (profile_id, session_key)
+          );
+          INSERT INTO latest_session_observations
+            SELECT * FROM latest_session_observations_status_v3;
+          DROP TABLE latest_session_observations_status_v3;
+        `);
+      }
+      this.db.exec(`
         DROP TABLE bindings_status_v3;
         DROP TABLE pools_status_v3;
         CREATE UNIQUE INDEX pools_by_subject
           ON pools(provider, subject_digest)
           WHERE subject_digest IS NOT NULL;
         CREATE INDEX bindings_by_pool ON bindings(pool_id);
-        COMMIT;
       `);
+      const violations = this.db.query<unknown, []>("PRAGMA foreign_key_check").all();
+      if (violations.length > 0) {
+        throw new Error("status migration left invalid foreign-key references");
+      }
+      this.db.exec("COMMIT");
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
@@ -672,10 +705,12 @@ export class UsageStore {
   private assess(pool: PoolRow, observation: UsageObservation): ReconciliationDecision {
     const incomingMs = Date.parse(observation.sampled_at);
     const existingMs = Date.parse(pool.sampled_at);
+    const incomingQuality = qualityRank(observation.sample_time_quality);
+    const existingQuality = qualityRank(pool.sample_quality);
     if (incomingMs < existingMs) return "older";
     if (
       incomingMs === existingMs &&
-      qualityRank(observation.sample_time_quality) < qualityRank(pool.sample_quality)
+      incomingQuality < existingQuality
     ) {
       return "older";
     }
@@ -716,7 +751,8 @@ export class UsageStore {
     if (
       incomingMs === existingMs &&
       JSON.stringify(observation.windows) === JSON.stringify(existing) &&
-      observation.status === pool.status
+      observation.status === pool.status &&
+      incomingQuality === existingQuality
     ) {
       return "same";
     }
@@ -1119,9 +1155,20 @@ function legacyObservation(
     throw new Error(`legacy usage entry ${index}.account must be an object`);
   }
   const account = entry.account as unknown as LegacyAccount;
-  const provider: UsageProvider = account.provider === "codex" || account.id?.toLowerCase().startsWith("codex")
-    ? "codex"
-    : "claude";
+  let provider: UsageProvider;
+  if (account.provider === undefined) {
+    provider = account.id?.toLowerCase().startsWith("codex") ? "codex" : "claude";
+  } else if (
+    account.provider === "claude" ||
+    account.provider === "codex" ||
+    account.provider === "grok"
+  ) {
+    provider = account.provider;
+  } else {
+    throw new Error(
+      `legacy usage entry ${index}.account.provider must be claude, codex, or grok when present`,
+    );
+  }
   let windows = account.windows;
   if (!Array.isArray(windows)) {
     windows = [];

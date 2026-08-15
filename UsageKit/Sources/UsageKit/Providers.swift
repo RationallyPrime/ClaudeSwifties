@@ -19,11 +19,15 @@ public struct UsageEndpointPolicy: Sendable, Equatable {
     public init() {}
 
     public func allows(_ endpoint: URL) -> Bool {
-        guard let scheme = endpoint.scheme?.lowercased(),
+        guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+            let scheme = endpoint.scheme?.lowercased(),
             let host = endpoint.host?.lowercased(),
             !host.isEmpty,
             endpoint.user == nil,
-            endpoint.password == nil
+            endpoint.password == nil,
+            components.percentEncodedPath == "/v3/usage",
+            components.query == nil,
+            components.fragment == nil
         else { return false }
 
         if scheme == "https" { return true }

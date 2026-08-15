@@ -103,6 +103,9 @@ private actor RecordingTransport: UsageHTTPTransport {
     #expect(policy.allows(try #require(URL(string: "http://localhost:8080/v3/usage"))))
     #expect(!policy.allows(try #require(URL(string: "http://usage.example/v3/usage"))))
     #expect(!policy.allows(try #require(URL(string: "https://user:pass@usage.example/v3/usage"))))
+    #expect(!policy.allows(try #require(URL(string: "https://usage.example/v1/usage"))))
+    #expect(!policy.allows(try #require(URL(string: "https://usage.example/v3/usage/"))))
+    #expect(!policy.allows(try #require(URL(string: "https://usage.example/v3/usage?format=json"))))
 }
 
 @Test func sharedKeychainQuerySelectsDataProtectionSemantics() {

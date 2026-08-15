@@ -110,3 +110,17 @@ private func isolatedStore(
     }
     #expect(secrets.readCount == 0)
 }
+
+@Test func persistedV1EndpointIsRejectedWithoutCompatibilityOrTokenAccess() {
+    let preferences = TestPreferences()
+    preferences.endpointString = "https://usage.example/v1/usage"
+    preferences.keychainMigrationComplete = true
+    let secrets = TestSecretStore(value: "secret")
+    let store = isolatedStore(preferences: preferences, secrets: secrets)
+
+    #expect(throws: UsageProviderError.unsafeEndpoint) {
+        try store.resolvedProvider()
+    }
+    #expect(preferences.endpointString == "https://usage.example/v1/usage")
+    #expect(secrets.readCount == 0)
+}

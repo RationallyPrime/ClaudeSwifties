@@ -196,7 +196,8 @@ public struct UsageStore: Sendable {
             switch providerError {
             case .badStatus(let status): return "Server returned HTTP \(status)."
             case .notHTTP: return "The endpoint did not return an HTTP response."
-            case .unsafeEndpoint: return "The endpoint must use HTTPS (except loopback development)."
+            case .unsafeEndpoint:
+                return "The endpoint must be the HTTPS /v3/usage URL (except loopback development)."
             case .unsafeRedirect: return "The endpoint attempted an unsafe cross-origin redirect."
             }
         }

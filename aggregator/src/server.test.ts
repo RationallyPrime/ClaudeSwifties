@@ -198,9 +198,17 @@ describe("schema-3 HTTP server", () => {
     // behind a shared proxy cannot lock out a valid credential.
     expect((await app.fetch(get("/v3/usage", READ_TOKEN), "attacker")).status).toBe(200);
     expect((await app.fetch(get("/v3/usage", READ_TOKEN), "reader")).status).toBe(200);
+    // A valid request bypasses the limiter but cannot erase the attack history
+    // accumulated for the shared client key.
+    const stillLimited = await app.fetch(
+      get("/v3/usage", "wrong-token-d-012345"),
+      "attacker",
+    );
+    expect(stillLimited.headers.get("retry-after")).toBe("1");
+    expect((await app.fetch(get("/v3/usage", READ_TOKEN), "attacker")).status).toBe(200);
     setNow("2026-08-15T15:30:02.001Z");
     expect((await app.fetch(
-      get("/v3/usage", "wrong-token-d-012345"),
+      get("/v3/usage", "wrong-token-e-012345"),
       "attacker",
     )).headers.get("retry-after"))
       .toBeNull();

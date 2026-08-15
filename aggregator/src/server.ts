@@ -78,10 +78,6 @@ class InvalidAuthLimiter {
     attempt.lastUsedAt = now;
   }
 
-  success(key: string): void {
-    this.attempts.delete(key);
-  }
-
   private ensureCapacity(): void {
     if (this.attempts.size < this.maximumKeys) return;
     let oldestKey: string | null = null;
@@ -125,7 +121,8 @@ export function createApp(options: AppOptions): UsageApp {
     // Invalid attempts are bounded per transport source and role, so rotating
     // bogus bearer values cannot evade the limiter. Valid credentials are
     // checked first and therefore cannot be locked out by another client that
-    // happens to share a reverse-proxy address.
+    // happens to share a reverse-proxy address. A success deliberately leaves
+    // that source's invalid-attempt history untouched.
     return `${clientKey}:${role}`;
   }
 
@@ -139,7 +136,6 @@ export function createApp(options: AppOptions): UsageApp {
     const key = authenticationKey(clientKey, "read");
     const authorised = bearer !== null && digestsEqual(digest, options.readTokenDigest);
     if (authorised) {
-      limiter.success(key);
       return { authorised: true, rateLimited: false };
     }
     if (limiter.blocked(key, at)) return { authorised: false, rateLimited: true };
@@ -162,7 +158,6 @@ export function createApp(options: AppOptions): UsageApp {
       if (digestsEqual(digest, credential.tokenDigest)) matched = credential;
     }
     if (bearer !== null && matched) {
-      limiter.success(key);
       return { credential: matched, rateLimited: false };
     }
     if (limiter.blocked(key, at)) return { credential: null, rateLimited: true };
