@@ -213,6 +213,25 @@ class InstallerTests(unittest.TestCase):
                     )
                     self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
 
+    def test_reinstall_rejects_profile_id_drift_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = self.environment(root, "codex", "codex-old")
+            self.run_installer("codex", environment)
+            config_path = Path(environment["CODEX_HOME"]) / "ai-usage" / "config.json"
+            manifest_path = config_path.with_name("install-manifest.json")
+            before_config = config_path.read_bytes()
+            before_manifest = manifest_path.read_bytes()
+
+            changed = dict(environment)
+            changed["AI_USAGE_PROFILE_ID"] = "codex-new"
+            result = self.run_installer("codex", changed, check=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not own this provider profile", result.stderr)
+            self.assertEqual(config_path.read_bytes(), before_config)
+            self.assertEqual(manifest_path.read_bytes(), before_manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

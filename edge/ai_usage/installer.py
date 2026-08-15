@@ -306,6 +306,7 @@ def install(provider: str) -> dict[str, Any]:
     if existing_manifest is not None and (
         existing_manifest.get("provider") != provider
         or existing_manifest.get("config_path") != str(config_path)
+        or existing_manifest.get("profile_id") != config.profile_id
     ):
         raise CollectorError(
             "collector install manifest does not own this provider profile"
@@ -351,6 +352,7 @@ def install(provider: str) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "schema": 1,
         "provider": provider,
+        "profile_id": config.profile_id,
         "config_path": str(config_path),
         "install_root": str(install_root),
         "service_kind": service_kind,

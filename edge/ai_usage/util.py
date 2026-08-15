@@ -71,9 +71,26 @@ def validate_display(value: Any, field: str, maximum: int = 120) -> str:
     if not isinstance(value, str):
         raise CollectorError(f"{field} must be a string")
     stripped = value.strip()
-    if not stripped or len(stripped) > maximum or CONTROL_RE.search(stripped):
+    if not stripped or utf16_length(stripped) > maximum or CONTROL_RE.search(stripped):
         raise CollectorError(f"{field} must be 1..{maximum} printable characters")
     return stripped
+
+
+def utf16_length(value: str) -> int:
+    """Match JavaScript string-length limits used by the aggregator."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def truncate_utf16(value: str, maximum: int) -> str:
+    used = 0
+    result: list[str] = []
+    for character in value:
+        width = utf16_length(character)
+        if used + width > maximum:
+            break
+        result.append(character)
+        used += width
+    return "".join(result)
 
 
 def display_text(value: Any, fallback: str, maximum: int = 120) -> str:
@@ -81,7 +98,7 @@ def display_text(value: Any, fallback: str, maximum: int = 120) -> str:
     if not isinstance(value, str):
         return fallback
     cleaned = CONTROL_RE.sub(" ", value).strip()
-    return cleaned[:maximum] or fallback
+    return truncate_utf16(cleaned, maximum) or fallback
 
 
 def normalize_identity(value: Any) -> str | None:

@@ -7,11 +7,11 @@ from pathlib import Path
 from unittest import mock
 
 from ai_usage.contract import QuotaWindow
+from ai_usage.errors import CollectorError
 from ai_usage.identity import IdentityHint
 from ai_usage.observation import make_observation
 from ai_usage.providers import ProviderReading
 from ai_usage.spool import FileLock, Spool
-from ai_usage.errors import CollectorError
 from ai_usage.supervisor import RuntimeState, Supervisor, doctor_report
 from ai_usage.transport import Acknowledgement, DeliveryFailure, ObservationTransport
 from ai_usage.util import UTC
@@ -366,7 +366,9 @@ class SupervisorTests(unittest.TestCase):
             queued = observation(config)
             Spool(config).enqueue(queued)
             transport = RecordingTransport()
-            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            supervisor = Supervisor(
+                config, transport=transport, clock=lambda: 1_786_795_200
+            )
             with mock.patch(
                 "ai_usage.supervisor.collect_provider",
                 side_effect=CollectorError(
@@ -389,7 +391,9 @@ class SupervisorTests(unittest.TestCase):
             config.last_sample_path.parent.mkdir(parents=True, exist_ok=True)
             config.last_sample_path.write_text("{not-json", encoding="utf-8")
             transport = RecordingTransport()
-            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            supervisor = Supervisor(
+                config, transport=transport, clock=lambda: 1_786_795_200
+            )
 
             with mock.patch(
                 "ai_usage.supervisor.collect_provider",
@@ -450,6 +454,55 @@ class SupervisorTests(unittest.TestCase):
             ) as collect:
                 follow_up.run()
                 collect.assert_not_called()
+
+    def test_backward_clock_jump_expires_scheduler_and_retry_deadlines(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), "codex", write=True)
+            queued = observation(config)
+            Spool(config).enqueue(queued)
+            runtime_path = config.state_dir / "runtime.json"
+            runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            runtime_path.write_text(
+                json.dumps(
+                    {
+                        "identity_checked_at": 5000,
+                        "sample_checked_at": 5000,
+                        "last_emit_at": 5000,
+                    }
+                )
+            )
+            config.retry_path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "observation_id": queued.observation_id,
+                        "attempt": 1,
+                        "recorded_at": 5000,
+                        "next_attempt_at": 5002,
+                    }
+                )
+            )
+            transport = RecordingTransport()
+            reading = ProviderReading(
+                IdentityHint("Z" * 43, "account_id"),
+                [QuotaWindow("five-hour", "5h", 300, 0.2, "2026-08-15T13:00:00Z")],
+                "ok",
+                "Codex · Account",
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+
+            with mock.patch(
+                "ai_usage.supervisor.collect_provider", return_value=reading
+            ) as collect:
+                result = supervisor.run()
+
+            collect.assert_called_once()
+            self.assertGreaterEqual(result["delivered"], 1)
+            self.assertEqual(Spool(config).stats()["pending"], 0)
+            runtime = json.loads(runtime_path.read_text())
+            self.assertLessEqual(runtime["identity_checked_at"], 1000)
+            self.assertLessEqual(runtime["sample_checked_at"], 1000)
+            self.assertLessEqual(runtime["last_emit_at"], 1000)
 
     def test_doctor_is_redacted_and_diagnostics_are_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:

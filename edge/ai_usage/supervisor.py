@@ -66,6 +66,11 @@ class RuntimeState:
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
+    def expire_future_scheduler_times(self, now: float) -> None:
+        for name in ("identity_checked_at", "sample_checked_at", "last_emit_at"):
+            if getattr(self, name) > now:
+                setattr(self, name, 0)
+
 
 class Diagnostics:
     def __init__(self, config: CollectorConfig):
@@ -186,9 +191,7 @@ class Supervisor:
         try:
             return self.spool.load_last_sample()
         except (CollectorError, OSError) as error:
-            self.diagnostics.write(
-                "last_sample_invalid", error=type(error).__name__
-            )
+            self.diagnostics.write("last_sample_invalid", error=type(error).__name__)
             try:
                 self.config.last_sample_path.unlink(missing_ok=True)
             except OSError as unlink_error:
@@ -398,7 +401,15 @@ class Supervisor:
         for pending in self.spool.pending():
             if retry.get("observation_id") == pending.observation.observation_id:
                 next_attempt = retry.get("next_attempt_at")
-                if isinstance(next_attempt, (int, float)) and next_attempt > now:
+                recorded_at = retry.get("recorded_at")
+                clock_moved_back = (
+                    isinstance(recorded_at, (int, float)) and recorded_at > now
+                )
+                if (
+                    not clock_moved_back
+                    and isinstance(next_attempt, (int, float))
+                    and next_attempt > now
+                ):
                     break
             try:
                 acknowledgement = self.transport.send(pending.observation)
@@ -420,6 +431,7 @@ class Supervisor:
                     "schema": 1,
                     "observation_id": pending.observation.observation_id,
                     "attempt": attempt,
+                    "recorded_at": now,
                     "next_attempt_at": now + delay,
                     "last_status": error.status,
                     "last_error": type(error).__name__,
@@ -457,9 +469,11 @@ class Supervisor:
         try:
             now = self.clock()
             state = self._load_runtime()
+            state.expire_future_scheduler_times(now)
             identity, identity_status = self._poll_identity(state, now)
             queued = 1 if self._collect(state, now) is not None else 0
             self._refresh_last_sample(state)
+            state.expire_future_scheduler_times(now)
             identity, identity_status = load_identity(self.config)
             queued += (
                 1

@@ -382,6 +382,53 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("Claude window continuity binding yields when subject and windows realign", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      pool_label: "Claude · Pool A",
+      windows: windows(0.6, "2026-08-15T18:00:00Z"),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-b",
+      provider_subject: SUBJECT_B,
+      sequence: 1,
+      pool_label: "Claude · Pool B",
+      windows: windows(0.4, "2026-08-15T19:00:00Z"),
+    }), "2026-08-15T15:30:02Z");
+
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.42, "2026-08-15T19:00:00Z"),
+    }), "2026-08-15T15:31:02Z");
+
+    const realigned = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:32:00Z",
+      observed_at: "2026-08-15T15:32:01Z",
+      pool_label: "Claude · Pool A",
+      windows: windows(0.62, "2026-08-15T18:00:00Z"),
+    }), "2026-08-15T15:32:02Z");
+
+    expect(realigned.outcome).toBe("accepted");
+    const snapshot = store.snapshot("2026-08-15T15:33:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    const poolB = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B));
+    expect(poolA?.windows[0]?.utilization).toBe(0.62);
+    expect(poolA?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("subject");
+    expect(poolB?.windows[0]?.utilization).toBe(0.42);
+    store.close();
+  });
+
   test("first subject evidence promotes the same session's exact-continuity provisional pool", async () => {
     const { store } = await freshStore();
     store.ingest(observation({

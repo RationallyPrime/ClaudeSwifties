@@ -78,6 +78,12 @@ class ContractTests(unittest.TestCase):
         value["sampled_at"] = "2026-08-15T12:00:01Z"
         with self.assertRaises(CollectorError):
             Observation.from_dict(value)
+
+    def test_display_limits_match_javascript_utf16_code_units(self):
+        value = self.observation().to_dict()
+        value["profile_label"] = "🚀" * 65
+        with self.assertRaises(CollectorError):
+            Observation.from_dict(value)
         value = self.observation().to_dict()
         value["source_host"] = "host\nforged-log-line"
         with self.assertRaises(CollectorError):

@@ -545,7 +545,8 @@ export class UsageStore {
       observation.provider === "claude" &&
       existingBinding?.provider === "claude" &&
       existingBinding.binding_confidence === "window_continuity" &&
-      existingBinding.pool_id !== hintedPool.id
+      existingBinding.pool_id !== hintedPool.id &&
+      !this.followsExactContinuity(hintedPool, observation)
     ) {
       const boundPool = this.poolById(existingBinding.pool_id);
       if (boundPool) {
