@@ -10,7 +10,7 @@ from .claude_sensor import claude_statusline
 from .config import CollectorConfig
 from .errors import CollectorError
 from .identity import IdentityHint
-from .spool import Sequence, Spool
+from .spool import ObserverInstance, Sequence, Spool
 from .util import read_json
 
 
@@ -90,6 +90,7 @@ def statusline(config_path: Path, raw_input: bytes) -> bytes:
             raw_input,
             config,
             sequence=Sequence(config).next,
+            observer_instance_id=ObserverInstance(config).read_or_create,
             identity=_identity(config),
         )
         fallback = result.text.encode("utf-8")

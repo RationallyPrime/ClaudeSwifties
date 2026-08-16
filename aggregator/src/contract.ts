@@ -49,6 +49,8 @@ export interface UsageWindow {
 export interface UsageObservation {
   schema: 3;
   observation_id: string;
+  observer_instance_id: string;
+  identity_key_id: string;
   sequence: number;
   provider: UsageProvider;
   edge_id: string;
@@ -124,6 +126,8 @@ const IDENTITY_EVIDENCE: readonly IdentityEvidence[] = [
 const OBSERVATION_FIELDS = new Set([
   "schema",
   "observation_id",
+  "observer_instance_id",
+  "identity_key_id",
   "sequence",
   "provider",
   "edge_id",
@@ -152,6 +156,7 @@ const WINDOW_FIELDS = new Set([
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SUBJECT_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+export const IDENTITY_KEY_ID_PATTERN = /^[A-Za-z0-9_-]{16}$/;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
@@ -300,6 +305,22 @@ export function parseObservation(input: unknown): UsageObservation {
     throw new ValidationError("observation_id must be an RFC-4122 UUID");
   }
 
+  const observerInstanceId = requireString(
+    record.observer_instance_id,
+    "observer_instance_id",
+    36,
+  );
+  if (!UUID_PATTERN.test(observerInstanceId)) {
+    throw new ValidationError("observer_instance_id must be an RFC-4122 UUID");
+  }
+
+  const identityKeyId = requireString(record.identity_key_id, "identity_key_id", 16);
+  if (!IDENTITY_KEY_ID_PATTERN.test(identityKeyId)) {
+    throw new ValidationError(
+      "identity_key_id must be a 16 character base64url identifier",
+    );
+  }
+
   if (!Number.isSafeInteger(record.sequence) || (record.sequence as number) < 0) {
     throw new ValidationError("sequence must be a non-negative safe integer");
   }
@@ -330,6 +351,8 @@ export function parseObservation(input: unknown): UsageObservation {
   return {
     schema: 3,
     observation_id: observationId.toLowerCase(),
+    observer_instance_id: observerInstanceId.toLowerCase(),
+    identity_key_id: identityKeyId,
     sequence: record.sequence as number,
     provider: requireEnum(record.provider, "provider", PROVIDERS),
     edge_id: requireIdentifier(record.edge_id, "edge_id"),

@@ -122,6 +122,10 @@ class CollectorConfig:
         return self.state_dir / "sequence"
 
     @property
+    def observer_instance_path(self) -> Path:
+        return self.state_dir / "observer-instance"
+
+    @property
     def diagnostics_path(self) -> Path:
         return self.state_dir / "diagnostics.jsonl"
 

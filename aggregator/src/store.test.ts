@@ -155,6 +155,87 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("a same-instance sequence regression is ignored but named per-profile", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({ sequence: 318, windows: windows(0.5) }), "2026-08-15T15:30:01Z");
+
+    // Same installation generation, NEW observation id, regressed counter —
+    // the signature of a sequence file lost to an unclean shutdown (written
+    // sync=false by budgeted design). The observation stays ignored, but the
+    // collector would otherwise be silently stranded until its counter
+    // climbs back past the server's mark: the doctor must name it.
+    const regressed = store.ingest(observation({
+      sequence: 3,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.6),
+    }), "2026-08-15T15:31:02Z");
+    expect(regressed.outcome).toBe("ignored");
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.last_conflict?.kind).toBe("sequence_regression");
+    store.close();
+  });
+
+  test("a fresh installation generation restarts its sequence legitimately", async () => {
+    const { store } = await freshStore();
+    // The old installation reached sequence 318.
+    expect(store.ingest(observation({
+      sequence: 318,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Reinstall without preserved state: new observer instance, sequence 0.
+    // Before instance scoping this was silently ignored forever — the
+    // stranded-profile failure the audit named.
+    const reinstalled = store.ingest(observation({
+      observer_instance_id: randomUUID(),
+      sequence: 0,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.61),
+    }), "2026-08-15T15:31:02Z");
+    expect(reinstalled.outcome).toBe("accepted");
+    expect(store.conflictCount()).toBe(1);
+
+    // The displacement of a recently live instance is preserved as explicit
+    // conflict evidence rather than silent competition — while the new
+    // instance's data still lands: the pool advanced, the row was replaced.
+    expect(store.snapshot("2026-08-15T15:32:00Z").pools[0]?.windows[0]?.utilization).toBe(0.61);
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.last_sequence).toBe(0);
+    expect(doctor[0]?.last_conflict?.kind).toBe("concurrent_observer_instances");
+
+    // The new instance's own monotonic rule still applies.
+    expect(store.ingest(observation({
+      observer_instance_id: doctor[0]?.observer_instance_id,
+      sequence: 0,
+      windows: windows(0.7),
+    }), "2026-08-15T15:33:00Z").outcome).toBe("ignored");
+    store.close();
+  });
+
+  test("a stale displaced instance is replaced without conflict evidence", async () => {
+    const { store } = await freshStore();
+    expect(store.ingest(observation({
+      sequence: 42,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // The next observation arrives a day later from a new installation. The
+    // displaced instance was not recently live, so this is an ordinary
+    // reinstall, not concurrent competition.
+    const result = store.ingest(observation({
+      observer_instance_id: randomUUID(),
+      sequence: 0,
+      sampled_at: "2026-08-16T15:30:00Z",
+      observed_at: "2026-08-16T15:30:01Z",
+      windows: windows(0.61),
+    }), "2026-08-16T15:30:02Z");
+    expect(result.outcome).toBe("accepted");
+    expect(store.conflictCount()).toBe(0);
+    store.close();
+  });
+
   test("duplicate observation ids are idempotently acknowledged", async () => {
     const { store } = await freshStore();
     const item = observation({ sequence: 1, windows: windows(0.5) });

@@ -11,13 +11,15 @@ from unittest import mock
 
 from ai_usage.claude_sensor import claude_statusline
 from ai_usage.contract import QuotaWindow
-from ai_usage.errors import SpoolFull
+from ai_usage.errors import CollectorError, SpoolFull
 from ai_usage.identity import IdentityHint
 from ai_usage.observation import make_observation
 from ai_usage.sensor_cli import statusline
-from ai_usage.spool import Sequence, Spool
+from ai_usage.spool import ObserverInstance, Sequence, Spool
 from ai_usage.util import UTC, atomic_write_json
 from test_support import make_config, write_executable
+
+TEST_OBSERVER_INSTANCE = "018f47f0-167a-7cc4-a3d1-d6f5eb04c0aa"
 
 EDGE_DIR = Path(__file__).resolve().parent
 STATUSLINE = EDGE_DIR / "statusline-usage.sh"
@@ -50,6 +52,7 @@ class ClaudeSensorTests(unittest.TestCase):
                 json.dumps(claude_payload(transcript)).encode(),
                 config,
                 sequence=8,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 identity=IdentityHint("A" * 43, "org_email"),
                 observed_at=observed,
             )
@@ -64,6 +67,7 @@ class ClaudeSensorTests(unittest.TestCase):
                 json.dumps(claude_payload(transcript)).encode(),
                 config,
                 sequence=9,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 identity=IdentityHint(None, "unknown"),
                 observed_at=observed,
             )
@@ -78,6 +82,7 @@ class ClaudeSensorTests(unittest.TestCase):
                 json.dumps(claude_payload(Path(temporary) / "missing")).encode(),
                 config,
                 sequence=1,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 identity=IdentityHint(None, "unknown"),
             )
             self.assertEqual(result.observation.sample_time_quality, "sensor_time")
@@ -85,6 +90,7 @@ class ClaudeSensorTests(unittest.TestCase):
                 b'{"model":{"display_name":"Sonnet"}}',
                 config,
                 sequence=2,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 identity=IdentityHint(None, "unknown"),
             )
             self.assertEqual(empty.text, "[Sonnet]\n")
@@ -169,6 +175,38 @@ class ClaudeSensorTests(unittest.TestCase):
             self.assertEqual(captured.read_bytes(), raw)
 
 
+class ObserverInstanceTests(unittest.TestCase):
+    def test_instance_is_created_once_and_survives_rereads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            instance = ObserverInstance(config)
+            self.assertIsNone(instance.peek())
+            created = instance.read_or_create()
+            self.assertEqual(created, instance.read_or_create())
+            self.assertEqual(created, instance.peek())
+            self.assertEqual(created, ObserverInstance(config).read_or_create())
+            mode = config.observer_instance_path.stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
+    def test_fresh_state_dir_is_a_new_installation_generation(self):
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
+            first_id = ObserverInstance(make_config(Path(first))).read_or_create()
+            second_id = ObserverInstance(make_config(Path(second))).read_or_create()
+            self.assertNotEqual(first_id, second_id)
+
+    def test_corrupt_instance_state_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            config.observer_instance_path.parent.mkdir(parents=True, exist_ok=True)
+            config.observer_instance_path.write_text("not-a-uuid\n")
+            with self.assertRaises(CollectorError):
+                ObserverInstance(config).read_or_create()
+            self.assertIsNone(ObserverInstance(config).peek())
+
+
 class SpoolTests(unittest.TestCase):
     def observation(
         self,
@@ -183,6 +221,7 @@ class SpoolTests(unittest.TestCase):
         now = dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
         return make_observation(
             config,
+            observer_instance_id=TEST_OBSERVER_INSTANCE,
             sequence=sequence,
             observed_at=now,
             sampled_at=sampled_at or now,

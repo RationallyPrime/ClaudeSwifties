@@ -165,6 +165,17 @@ describe("schema-3 HTTP server", () => {
     expect(wrongProfile.status).toBe(403);
     expect(await wrongEdge.text()).toBe('{"error":"forbidden"}');
     expect(store.snapshot("2026-08-15T15:31:00Z").pools).toEqual([]);
+
+    // The rejection is evidence, keyed on the CREDENTIAL's edge id (payload
+    // fields are attacker-controlled within an authenticated edge): the
+    // doctor names which edge is being refused and how often.
+    const doctor = await app.fetch(get("/doctor", READ_TOKEN), "reader");
+    expect(doctor.status).toBe(200);
+    const report = await doctor.json() as Record<string, unknown>;
+    const edges = report.edges as Array<Record<string, unknown>>;
+    expect(edges.map((edge) => edge.edge_id).sort()).toEqual(["edge-linux"]);
+    expect(edges[0]?.forbidden_count).toBe(2);
+    expect(typeof edges[0]?.last_forbidden_at).toBe("string");
     store.close();
   });
 
@@ -329,8 +340,128 @@ describe("schema-3 HTTP server", () => {
     expect((await app.fetch(get("/doctor"))).status).toBe(401);
     const response = await app.fetch(get("/doctor", READ_TOKEN), "doctor-client");
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ schema: 3, ready: true, conflict_count: 1 });
-    // Doctor exposes only the bounded count, never observation payload details.
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.schema).toBe(3);
+    expect(body.ready).toBe(true);
+    expect(body.conflict_count).toBe(1);
+    expect(body.identity_key_mismatch_count).toBe(0);
+    expect(body.last_identity_key_mismatch).toBeNull();
+
+    // The reporting profile carries its full operational projection.
+    const profiles = body.profiles as Record<string, unknown>[];
+    const reporting = profiles.find((row) => row.profile_id === "desktop-a");
+    expect(reporting).toMatchObject({
+      configured: true,
+      edge_id: "edge-linux",
+      provider: "claude",
+      observer_instance_id: VALID_OBSERVATION.observer_instance_id,
+      identity_key_id: VALID_OBSERVATION.identity_key_id,
+      last_sequence: 2,
+      freshness: "current",
+    });
+    expect(reporting?.first_seen_at).toBeTruthy();
+    const lastConflict = reporting?.last_conflict as Record<string, unknown>;
+    expect(typeof lastConflict.kind).toBe("string");
+    expect(typeof lastConflict.at).toBe("string");
+
+    // Configured-but-silent profiles appear as never-seen, not as absent.
+    const silent = profiles.find((row) => row.profile_id === "other-profile");
+    expect(silent).toMatchObject({
+      configured: true,
+      edge_id: "edge-other",
+      freshness: "never",
+      last_received_at: null,
+    });
+
+    // Doctor exposes bounded evidence, never payloads or provider subjects.
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain(VALID_OBSERVATION.provider_subject);
+    expect(raw).not.toContain("payload");
     store.close();
   });
+
+  test("a wrong identity-key namespace is rejected loudly and counted", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-v3-keyid-"));
+    const store = await openStore(dir, DEFAULT_STORE_OPTIONS);
+    const app = createApp({
+      store,
+      readTokenDigest: digestToken(READ_TOKEN),
+      edgeCredentials: [{
+        tokenDigest: digestToken(EDGE_TOKEN),
+        edgeId: "edge-linux",
+        profileIds: new Set(["desktop-a"]),
+      }],
+      invalidAuthMaxAttempts: 20,
+      invalidAuthWindowMs: 60_000,
+      expectedIdentityKeyId: VALID_OBSERVATION.identity_key_id,
+      log: () => {},
+    });
+
+    const accepted = await app.fetch(post(observation({ sequence: 1 })));
+    expect(accepted.status).toBe(200);
+
+    const mismatched = await app.fetch(post(observation({
+      sequence: 2,
+      identity_key_id: "Zz9y8X7w6V5u4T3s",
+    })));
+    expect(mismatched.status).toBe(422);
+    expect(await mismatched.json()).toEqual({
+      error: "identity_key_id does not match this aggregator's namespace",
+      presented_key_id: "Zz9y8X7w6V5u4T3s",
+      expected_key_id: VALID_OBSERVATION.identity_key_id,
+    });
+
+    const doctor = await app.fetch(get("/doctor", READ_TOKEN), "doctor-client");
+    const body = await doctor.json() as Record<string, unknown>;
+    expect(body.identity_key_mismatch_count).toBe(1);
+    expect(body.last_identity_key_mismatch).toMatchObject({
+      profile_id: "desktop-a",
+      edge_id: "edge-linux",
+      presented_key_id: "Zz9y8X7w6V5u4T3s",
+    });
+    // The mismatch never reaches ingest, so without a per-profile conflicts
+    // row the affected collector would keep projecting its last good
+    // observation while being 100% rejected. The doctor must name it.
+    const profiles = body.profiles as Array<Record<string, unknown>>;
+    const affected = profiles.find((row) => row.profile_id === "desktop-a");
+    expect(affected?.last_conflict).toMatchObject({
+      kind: "identity_key_mismatch",
+    });
+    store.close();
+  });
+});
+
+test("a collector mis-provisioned from first boot is still named by the doctor", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "usage-v3-keyid-boot-"));
+  const store = await openStore(dir, DEFAULT_STORE_OPTIONS);
+  const app = createApp({
+    store,
+    readTokenDigest: digestToken(READ_TOKEN),
+    edgeCredentials: [{
+      tokenDigest: digestToken(EDGE_TOKEN),
+      edgeId: "edge-linux",
+      profileIds: new Set(["desktop-a"]),
+    }],
+    invalidAuthMaxAttempts: 20,
+    invalidAuthWindowMs: 60_000,
+    expectedIdentityKeyId: VALID_OBSERVATION.identity_key_id,
+    log: () => {},
+  });
+
+  // No accepted observation first: the rejection happens before ingest, so
+  // this profile has neither a sequence nor a receipt — its only trace is
+  // the conflicts row, which the read side must not drop.
+  const mismatched = await app.fetch(post(observation({
+    sequence: 1,
+    identity_key_id: "Zz9y8X7w6V5u4T3s",
+  })));
+  expect(mismatched.status).toBe(422);
+
+  const doctor = await app.fetch(get("/doctor", READ_TOKEN), "doctor-client");
+  const body = await doctor.json() as Record<string, unknown>;
+  const profiles = body.profiles as Array<Record<string, unknown>>;
+  const affected = profiles.find((row) => row.profile_id === "desktop-a");
+  expect(affected).toBeDefined();
+  expect(affected?.last_conflict).toMatchObject({ kind: "identity_key_mismatch" });
+  store.close();
 });

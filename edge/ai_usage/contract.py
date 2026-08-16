@@ -26,6 +26,20 @@ IDENTITY_EVIDENCE = {
     "unknown",
 }
 SUBJECT_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
+IDENTITY_KEY_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{16}\Z")
+
+
+def _canonical_uuid(value: str, field: str) -> None:
+    try:
+        parsed_uuid = uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError) as error:
+        raise CollectorError(f"{field} must be a UUID") from error
+    if (
+        str(parsed_uuid) != value.lower()
+        or parsed_uuid.version not in range(1, 9)
+        or parsed_uuid.variant != uuid.RFC_4122
+    ):
+        raise CollectorError(f"{field} must use canonical UUID form")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,6 +97,8 @@ class QuotaWindow:
 @dataclasses.dataclass(frozen=True)
 class Observation:
     observation_id: str
+    observer_instance_id: str
+    identity_key_id: str
     sequence: int
     provider: str
     edge_id: str
@@ -105,16 +121,15 @@ class Observation:
     def __post_init__(self) -> None:
         if self.schema != 3:
             raise CollectorError("observation.schema must be 3")
-        try:
-            parsed_uuid = uuid.UUID(self.observation_id)
-        except (ValueError, TypeError, AttributeError) as error:
-            raise CollectorError("observation_id must be a UUID") from error
+        _canonical_uuid(self.observation_id, "observation_id")
+        _canonical_uuid(self.observer_instance_id, "observer_instance_id")
         if (
-            str(parsed_uuid) != self.observation_id.lower()
-            or parsed_uuid.version not in range(1, 9)
-            or parsed_uuid.variant != uuid.RFC_4122
+            not isinstance(self.identity_key_id, str)
+            or IDENTITY_KEY_ID_PATTERN.fullmatch(self.identity_key_id) is None
         ):
-            raise CollectorError("observation_id must use canonical UUID form")
+            raise CollectorError(
+                "identity_key_id must be a 16 character base64url identifier"
+            )
         if (
             isinstance(self.sequence, bool)
             or not isinstance(self.sequence, int)
@@ -170,6 +185,8 @@ class Observation:
         return {
             "schema": 3,
             "observation_id": self.observation_id,
+            "observer_instance_id": self.observer_instance_id,
+            "identity_key_id": self.identity_key_id,
             "sequence": self.sequence,
             "provider": self.provider,
             "edge_id": self.edge_id,
@@ -196,6 +213,8 @@ class Observation:
         expected = {
             "schema",
             "observation_id",
+            "observer_instance_id",
+            "identity_key_id",
             "sequence",
             "provider",
             "edge_id",
@@ -226,6 +245,8 @@ class Observation:
         return cls(
             schema=value.get("schema"),
             observation_id=value.get("observation_id"),
+            observer_instance_id=value.get("observer_instance_id"),
+            identity_key_id=value.get("identity_key_id"),
             sequence=value.get("sequence"),
             provider=value.get("provider"),
             edge_id=value.get("edge_id"),

@@ -1,11 +1,14 @@
 import datetime as dt
+import io
 import json
 import tempfile
 import unittest
 import urllib.error
+from email.message import Message
 from pathlib import Path
 from unittest import mock
 
+from ai_usage import transport as transport_module
 from ai_usage.contract import QuotaWindow
 from ai_usage.errors import CollectorError
 from ai_usage.identity import IdentityHint
@@ -17,11 +20,14 @@ from ai_usage.transport import Acknowledgement, DeliveryFailure, ObservationTran
 from ai_usage.util import UTC
 from test_support import make_config
 
+TEST_OBSERVER_INSTANCE = "018f47f0-167a-7cc4-a3d1-d6f5eb04c0aa"
+
 
 def observation(config, sequence=1, utilization=0.42):
     now = dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
     return make_observation(
         config,
+        observer_instance_id=TEST_OBSERVER_INSTANCE,
         sequence=sequence,
         observed_at=now,
         sampled_at=now,
@@ -278,6 +284,7 @@ class SupervisorTests(unittest.TestCase):
             # Rebuild under the Grok provider config.
             sample = make_observation(
                 config,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 sequence=1,
                 observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
                 sampled_at=dt.datetime(2026, 8, 15, 11, 59, tzinfo=UTC),
@@ -314,6 +321,7 @@ class SupervisorTests(unittest.TestCase):
             config = make_config(Path(temporary), "grok")
             previous = make_observation(
                 config,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 sequence=1,
                 observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
                 sampled_at=dt.datetime(2026, 8, 15, 11, 59, tzinfo=UTC),
@@ -417,6 +425,7 @@ class SupervisorTests(unittest.TestCase):
                 spool.enqueue(
                     make_observation(
                         config,
+                        observer_instance_id=TEST_OBSERVER_INSTANCE,
                         sequence=sequence,
                         observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
                         sampled_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
@@ -528,3 +537,220 @@ class SupervisorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PermanentRejectionTests(unittest.TestCase):
+    def test_permanent_422_is_quarantined_and_the_drain_continues(self):
+        """A content verdict (400/413/422) must not head-of-line block the
+        spool: the observation is quarantined as evidence and the ones
+        behind it still deliver — the cutover wedge Theoros reproduced."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            first, second = observation(config, 1), observation(config, 2)
+            spool.enqueue(first)
+            spool.enqueue(second)
+            transport = RecordingTransport(
+                failures=[
+                    DeliveryFailure(
+                        "namespace", status=422, aggregator_error="namespace"
+                    ),
+                    None,
+                ]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            state = RuntimeState()
+            self.assertEqual(supervisor._drain(state, 1000), 1)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 0)
+            self.assertEqual(stats["rejected"], 1)
+            self.assertFalse(config.retry_path.exists())
+            reasons = list(spool.rejected_dir.glob("*.reason.json"))
+            self.assertEqual(len(reasons), 1)
+            self.assertIn("422", reasons[0].read_text())
+
+    def test_transient_503_still_backs_off_and_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[DeliveryFailure("unavailable", status=503)]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            state = RuntimeState()
+            self.assertEqual(supervisor._drain(state, 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
+            self.assertTrue(config.retry_path.exists())
+
+    def test_unparseable_spooled_file_is_quarantined_not_wedging(self):
+        """A pre-upgrade spool file the collector can no longer parse is a
+        permanent fact about that file; pending() quarantines it and yields
+        the deliverable remainder instead of raising."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            old_shape, good = observation(config, 1), observation(config, 2)
+            spool.enqueue(old_shape)
+            spool.enqueue(good)
+            first_path = spool._paths()[0]
+            stale = json.loads(first_path.read_text())
+            del stale["observer_instance_id"]
+            del stale["identity_key_id"]
+            first_path.write_text(json.dumps(stale))
+
+            pending = list(spool.pending())
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].observation.observation_id, good.observation_id)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 1)
+
+            # The whole tick still completes: drain delivers the good one.
+            transport = RecordingTransport()
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 1)
+            self.assertEqual(spool.stats()["pending"], 0)
+
+    def test_permanent_403_is_quarantined_like_422(self):
+        """This aggregator's only forbidden() tests two fields OF the
+        observation — a payload verdict, not credential rotation (401)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[
+                    DeliveryFailure(
+                        "forbidden", status=403, aggregator_error="forbidden"
+                    )
+                ]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            self.assertEqual(spool.stats()["rejected"], 1)
+            self.assertEqual(spool.stats()["pending"], 0)
+
+    def test_intermediary_403_without_a_verdict_document_backs_off(self):
+        """The wire status has producers that are not this aggregator: an
+        ingress/tunnel/WAF 403 (HTML or empty body) must stay on the
+        transient backoff path — quarantining it destroys observations
+        that deliver fine once the ingress is fixed."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[DeliveryFailure("tunnel", status=403)]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
+            self.assertTrue(config.retry_path.exists())
+
+    def test_wire_413_is_always_transient(self):
+        """The edge refuses oversize payloads at encode, so an aggregator
+        413 is unreachable for a queued observation — a wire 413 is an
+        ingress body limit, and never a payload verdict."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[
+                    DeliveryFailure(
+                        "too large", status=413, aggregator_error="body too large"
+                    )
+                ]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
+
+    def test_rejected_lane_inherits_the_spool_bound(self):
+        """A persistent rejection condition must not turn the bounded spool
+        into unbounded local growth: oldest evidence is pruned first."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), spool_max_count=8)
+            spool = Spool(config)
+            for sequence in range(1, 12):
+                spool.enqueue(observation(config, sequence))
+                spool.quarantine(spool._paths()[0], f"reject {sequence}")
+            self.assertEqual(spool.stats()["rejected"], 8)
+            reasons = sorted(
+                p.read_text() for p in spool.rejected_dir.glob("*.reason.json")
+            )
+            self.assertEqual(len(reasons), 8)
+            joined = " ".join(reasons)
+            for pruned in ('"reject 1"', '"reject 2"', '"reject 3"'):
+                self.assertNotIn(pruned, joined)
+            self.assertIn('"reject 11"', joined)
+
+
+class AggregatorVerdictRecognitionTests(unittest.TestCase):
+    """_aggregator_error_code is the permanence gate: strict by construction."""
+
+    @staticmethod
+    def _http_error(
+        code: int, body: bytes, content_type: str | None
+    ) -> urllib.error.HTTPError:
+        headers = Message()
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        return urllib.error.HTTPError(
+            "https://aggregator.example/v3/observations",
+            code,
+            "err",
+            headers,
+            io.BytesIO(body),
+        )
+
+    def test_recognises_the_aggregator_error_document(self):
+        error = self._http_error(403, b'{"error":"forbidden"}', "application/json")
+        self.assertEqual(transport_module._aggregator_error_code(error), "forbidden")
+
+    def test_html_bodies_are_not_verdicts(self):
+        error = self._http_error(
+            403, b"<html>Access denied</html>", "text/html; charset=utf-8"
+        )
+        self.assertIsNone(transport_module._aggregator_error_code(error))
+
+    def test_json_content_type_with_unrecognised_shape_is_not_a_verdict(self):
+        for body in (b"[]", b'{"detail":"nope"}', b'{"error":""}', b"not json"):
+            error = self._http_error(403, body, "application/json")
+            self.assertIsNone(transport_module._aggregator_error_code(error), body)
+
+    def test_missing_content_type_is_not_a_verdict(self):
+        error = self._http_error(403, b'{"error":"forbidden"}', None)
+        self.assertIsNone(transport_module._aggregator_error_code(error))
+
+
+class RejectedLaneByteBoundTests(unittest.TestCase):
+    def test_rejected_lane_honours_the_byte_bound_too(self):
+        """The pending spool is bounded by count AND bytes; the evidence lane
+        must inherit the pair, not just the count — a tight byte bound with
+        a loose count bound must still bound the lane's disk use."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(
+                Path(temporary), spool_max_count=400, spool_max_bytes=65536
+            )
+            spool = Spool(config)
+            for sequence in range(1, 121):
+                spool.enqueue(observation(config, sequence))
+                spool.quarantine(spool._paths()[0], f"reject {sequence}")
+            lane_bytes = 0
+            for path in spool.rejected_dir.iterdir():
+                lane_bytes += path.stat().st_size
+            self.assertLessEqual(lane_bytes, config.spool_max_bytes)
+            self.assertGreater(spool.stats()["rejected"], 0)
+            # The newest evidence survives the prune.
+            reasons = " ".join(
+                p.read_text() for p in spool.rejected_dir.glob("*.reason.json")
+            )
+            self.assertIn('"reject 120"', reasons)

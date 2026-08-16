@@ -1,6 +1,8 @@
 export const VALID_OBSERVATION = {
   schema: 3,
   observation_id: "018f47f0-167a-7cc4-a3d1-d6f5eb04c4f3",
+  observer_instance_id: "018f47f0-167a-7cc4-a3d1-d6f5eb04c0aa",
+  identity_key_id: "A1b2C3d4E5f6G7h8",
   sequence: 41,
   provider: "claude",
   edge_id: "edge-linux",

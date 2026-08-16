@@ -15,6 +15,7 @@ async function main(): Promise<void> {
     edgeCredentials: config.edgeCredentials,
     invalidAuthMaxAttempts: config.invalidAuthMaxAttempts,
     invalidAuthWindowMs: config.invalidAuthWindowMs,
+    expectedIdentityKeyId: config.expectedIdentityKeyId,
   });
 
   const server = Bun.serve({

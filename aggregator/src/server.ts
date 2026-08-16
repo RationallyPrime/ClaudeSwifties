@@ -2,6 +2,7 @@ import { digestToken, digestsEqual, type EdgeCredential } from "./config.js";
 import { parseObservation, ValidationError, type UsageObservation, type UsageSnapshot } from "./contract.js";
 import {
   StoreCapacityError,
+  type DoctorProfile,
   type IngestResult,
 } from "./store.js";
 
@@ -15,6 +16,19 @@ export interface ServerStore {
   snapshot(generatedAt: string): UsageSnapshot;
   probeReady(at: string): void;
   conflictCount(): number;
+  recordIdentityKeyMismatch(
+    observationId: string,
+    profileId: string,
+    edgeId: string,
+    presentedKeyId: string,
+    expectedKeyId: string,
+    at: string,
+  ): void;
+  identityKeyMismatchCount(): number;
+  lastIdentityKeyMismatch(): Record<string, unknown> | null;
+  doctorProfiles(generatedAt: string): DoctorProfile[];
+  recordEdgeForbidden(edgeId: string, observationId: string, at: string): void;
+  doctorEdges(): Array<Record<string, unknown>>;
 }
 
 export interface AppOptions {
@@ -23,6 +37,7 @@ export interface AppOptions {
   edgeCredentials: readonly EdgeCredential[];
   invalidAuthMaxAttempts: number;
   invalidAuthWindowMs: number;
+  expectedIdentityKeyId?: string | null;
   now?: () => Date;
   log?: (message: string) => void;
 }
@@ -192,10 +207,51 @@ export function createApp(options: AppOptions): UsageApp {
         if (!auth.authorised) return unauthorised(auth.rateLimited, options.invalidAuthWindowMs);
         try {
           options.store.probeReady(currentIso);
+          // Configured-but-silent profiles must appear: a collector that never
+          // reached the server is exactly what this surface exists to expose.
+          const configured = new Map<string, string>();
+          for (const credential of options.edgeCredentials) {
+            for (const profileId of credential.profileIds) {
+              configured.set(profileId, credential.edgeId);
+            }
+          }
+          const observed = options.store.doctorProfiles(currentIso);
+          const observedIds = new Set(observed.map((profile) => profile.profile_id));
+          const profiles = [
+            ...observed.map((profile) => ({
+              ...profile,
+              configured: configured.has(profile.profile_id),
+            })),
+            ...[...configured.entries()]
+              .filter(([profileId]) => !observedIds.has(profileId))
+              .map(([profileId, edgeId]) => ({
+                profile_id: profileId,
+                observer_instance_id: null,
+                edge_id: edgeId,
+                provider: null,
+                first_seen_at: null,
+                last_received_at: null,
+                last_sampled_at: null,
+                last_sequence: null,
+                last_outcome: null,
+                pool_id: null,
+                binding_confidence: null,
+                identity_evidence: null,
+                identity_key_id: null,
+                freshness: "never" as const,
+                last_conflict: null,
+                configured: true,
+              })),
+          ].sort((a, b) => a.profile_id.localeCompare(b.profile_id));
           return json({
             schema: 3,
             ready: true,
             conflict_count: options.store.conflictCount(),
+            expected_identity_key_id: options.expectedIdentityKeyId ?? null,
+            identity_key_mismatch_count: options.store.identityKeyMismatchCount(),
+            last_identity_key_mismatch: options.store.lastIdentityKeyMismatch(),
+            edges: options.store.doctorEdges(),
+            profiles,
           });
         } catch {
           return json({ schema: 3, ready: false, conflict_count: null }, 503);
@@ -221,7 +277,46 @@ export function createApp(options: AppOptions): UsageApp {
             observation.edge_id !== credential.edgeId ||
             !credential.profileIds.has(observation.profile_id)
           ) {
+            // The evidence 422 already gets: this rejection destroys the
+            // observation for a correctly-behaving collector, so it must be
+            // visible in the doctor, keyed on the CREDENTIAL's edge id (the
+            // payload's fields are attacker-controlled within an
+            // authenticated edge).
+            options.store.recordEdgeForbidden(
+              credential.edgeId,
+              observation.observation_id,
+              currentIso,
+            );
+            log(
+              `observation forbidden edge=${credential.edgeId} ` +
+              `claimed_edge=${observation.edge_id} ` +
+              `claimed_profile=${observation.profile_id}`,
+            );
             return forbidden();
+          }
+          const expectedKeyId = options.expectedIdentityKeyId ?? null;
+          if (expectedKeyId !== null && observation.identity_key_id !== expectedKeyId) {
+            // A wrong identity-key namespace would split one account into
+            // several apparently verified pools. Reject loudly with the two
+            // non-secret identifiers so the operator can fix provisioning.
+            options.store.recordIdentityKeyMismatch(
+              observation.observation_id,
+              observation.profile_id,
+              observation.edge_id,
+              observation.identity_key_id,
+              expectedKeyId,
+              currentIso,
+            );
+            log(
+              `observation rejected identity_key_mismatch ` +
+              `edge=${observation.edge_id} profile=${observation.profile_id} ` +
+              `presented=${observation.identity_key_id} expected=${expectedKeyId}`,
+            );
+            return json({
+              error: "identity_key_id does not match this aggregator's namespace",
+              presented_key_id: observation.identity_key_id,
+              expected_key_id: expectedKeyId,
+            }, 422);
           }
           const result = options.store.ingest(observation, currentIso);
           log(

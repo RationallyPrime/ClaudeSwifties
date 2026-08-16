@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,57 @@ class Sequence:
             # path budget by an order of magnitude on APFS.
             atomic_write_bytes(
                 self.path, f"{value}\n".encode("ascii"), mode=0o600, sync=False
+            )
+            return value
+
+
+class ObserverInstance:
+    """Immutable installation-generation identity for one collector state dir.
+
+    The server keys its per-profile sequence high-water mark on
+    ``(observer_instance_id, sequence)``. A reinstalled or relocated collector
+    whose state dir was not preserved starts a new instance and therefore a
+    new legitimate sequence, instead of being silently ignored against the
+    previous installation's counter.
+    """
+
+    def __init__(self, config: CollectorConfig):
+        self.path = config.observer_instance_path
+        self.lock_path = config.state_dir / "sequence.lock"
+
+    def peek(self) -> str | None:
+        """Read without creating — for the read-only doctor path."""
+        try:
+            raw = self.path.read_text(encoding="ascii").strip()
+            return str(uuid.UUID(raw)) if raw else None
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+
+    def read_or_create(self) -> str:
+        try:
+            raw = self.path.read_text(encoding="ascii").strip()
+            if raw:
+                return str(uuid.UUID(raw))
+            raise CollectorError("observer instance state is empty")
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise CollectorError("observer instance state is corrupt") from error
+        with FileLock(self.lock_path):
+            # Re-read under the lock: a concurrent process may have won.
+            try:
+                raw = self.path.read_text(encoding="ascii").strip()
+                if raw:
+                    return str(uuid.UUID(raw))
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                raise CollectorError("observer instance state is corrupt") from error
+            value = str(uuid.uuid4())
+            atomic_write_bytes(
+                self.path, f"{value}\n".encode("ascii"), mode=0o600, sync=True
             )
             return value
 
@@ -284,10 +336,86 @@ class Spool:
                 value = read_json(path, maximum_bytes=MAX_OBSERVATION_BYTES)
                 observation = Observation.from_dict(value)
             except (CollectorError, OSError) as error:
-                raise CollectorError(
-                    f"queued observation is corrupt: {path.name}"
-                ) from error
+                # A file this collector can no longer parse — a pre-upgrade
+                # shape or corruption — is a permanent fact about that file.
+                # Raising here wedges the whole drain behind it forever (the
+                # supervisor's tick dies before runtime state is saved), so
+                # the file is quarantined as durable evidence and the drain
+                # continues with the deliverable remainder.
+                self.quarantine(path, f"unparseable queued observation: {error}")
+                continue
             yield PendingObservation(path=path, observation=observation)
+
+    def quarantine(self, path: Path, reason: str) -> None:
+        """Move one spooled file to the rejected lane, with its reason.
+
+        The rejected lane is evidence, not a retry queue: nothing re-reads
+        it. ``stats()`` counts it and the doctor surfaces it, so a muted
+        observation is loud without blocking the ones behind it.
+        """
+        with FileLock(self.config.state_dir / "spool.lock"):
+            rejected = self.rejected_dir
+            private_directory(rejected)
+            target = rejected / path.name
+            try:
+                path.replace(target)
+            except FileNotFoundError:
+                return
+            atomic_write_json(
+                target.with_name(f"{target.name}.reason.json"),
+                {"schema": 1, "reason": reason, "rejected_at": time.time()},
+                mode=0o600,
+            )
+            # The lane inherits BOTH of the spool's bounds: it is evidence,
+            # not a second unbounded queue. Under a persistent rejection
+            # condition the pre-quarantine failure mode was bounded
+            # (SpoolFull) by count AND bytes, so the cure must not trade a
+            # bounded wedge for growth bounded only by the count the
+            # operator may not have used to bound anything. Oldest evidence
+            # is dropped first; the newest rejections are the ones a doctor
+            # run will be asked about.
+            kept = sorted(
+                p
+                for p in rejected.iterdir()
+                if p.name.endswith(".json") and not p.name.endswith(".reason.json")
+            )
+
+            def lane_bytes(paths: list[Path]) -> int:
+                total = 0
+                for entry in paths:
+                    for candidate in (
+                        entry,
+                        entry.with_name(f"{entry.name}.reason.json"),
+                    ):
+                        try:
+                            total += candidate.stat().st_size
+                        except FileNotFoundError:
+                            continue
+                return total
+
+            excess = max(0, len(kept) - self.config.spool_max_count)
+            while excess < len(kept) and (
+                lane_bytes(kept[excess:]) > self.config.spool_max_bytes
+            ):
+                excess += 1
+            for stale in kept[:excess]:
+                stale.unlink(missing_ok=True)
+                stale.with_name(f"{stale.name}.reason.json").unlink(missing_ok=True)
+
+    @property
+    def rejected_dir(self) -> Path:
+        return self.config.state_dir / "rejected"
+
+    def rejected_count(self) -> int:
+        try:
+            return sum(
+                1
+                for path in self.rejected_dir.iterdir()
+                if path.name.endswith(".json")
+                and not path.name.endswith(".reason.json")
+            )
+        except FileNotFoundError:
+            return 0
 
     def acknowledge(self, pending: PendingObservation) -> None:
         # Unlink only the exact immutable path that was acknowledged.
@@ -301,7 +429,12 @@ class Spool:
         if paths:
             current = time.time() if now is None else now
             oldest_age = max(0.0, current - paths[0].stat().st_mtime)
-        return {"pending": len(paths), "bytes": size, "oldest_age_seconds": oldest_age}
+        return {
+            "pending": len(paths),
+            "bytes": size,
+            "oldest_age_seconds": oldest_age,
+            "rejected": self.rejected_count(),
+        }
 
     def save_last_sample(self, observation: Observation) -> None:
         atomic_write_json(
