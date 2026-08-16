@@ -26,12 +26,17 @@ as an unauthenticated load-balancer probe.
 
 Collectors send a strict JSON object. Unknown fields at the top level or in a
 window are rejected, so an accidentally added credential or raw provider
-response fails closed instead of being stored.
+response fails closed instead of being stored. `observer_instance_id` is the
+installation UUID (RFC-4122). `identity_key_id` is the 16-character base64url
+fingerprint `base64url(HMAC(identity_key, "ai-usage-identity-namespace/v1"))[:16]`.
+Both are required.
 
 ```json
 {
   "schema": 3,
   "observation_id": "018f47f0-167a-7cc4-a3d1-d6f5eb04c4f3",
+  "observer_instance_id": "018f47f0-167a-7cc4-a3d1-d6f5eb04c0aa",
+  "identity_key_id": "A1b2C3d4E5f6G7h8",
   "sequence": 41,
   "provider": "claude",
   "edge_id": "edge-linux",
@@ -158,8 +163,13 @@ restarts even though the importer input has been removed.
 | `INVALID_AUTH_MAX_ATTEMPTS` | `20` | integer `1..1000` |
 | `INVALID_AUTH_WINDOW_SECONDS` | `60` | integer `1..3600` |
 | `REQUIRE_LEGACY_IMPORT` | `false` | `true/false/1/0` |
+| `EXPECTED_IDENTITY_KEY_ID` | unset | 16-character base64url `identity_key_id`; unset or empty disables the namespace guard |
 
-`READ_TOKEN` and `EDGE_CREDENTIALS_JSON` are mandatory.
+`READ_TOKEN` and `EDGE_CREDENTIALS_JSON` are mandatory. Set
+`EXPECTED_IDENTITY_KEY_ID` to the fleet fingerprint the collectors send
+(`identity_key_id`) once every collector has been re-provisioned; the checked-in
+`compose.yml` forwards the host / `.env` value into the container. Leave it
+unset to accept any well-formed fingerprint.
 
 ## HTTP boundary
 
