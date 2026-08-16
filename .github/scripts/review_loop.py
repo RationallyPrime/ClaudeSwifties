@@ -18,8 +18,10 @@ Commands:
     Add one ``@codex review`` comment (with an exact-head marker) per stalled,
     unreviewed head until the bounded automatic loop is exhausted, and
     re-deliver a standing verdict once per authoritative same-head verdict
-    whose seat never acted.  A wake fires exactly once from an event-driven
-    path; a consumed
+    whose seat never acted.  A substitute summon that never produced a
+    verdict is the same stall class: the assignment stays with that actor
+    and the existing wake is re-delivered after the same window.  A wake
+    fires exactly once from an event-driven path; a consumed
     wake with no new GitHub event is otherwise silence forever.  The scheduled
     exhaustion path posts the same human gate as ``route`` but does not wake
     Theoros: the retrospective requires findings still present on the exact
@@ -78,6 +80,10 @@ EXHAUSTED_MARKER_RE = re.compile(
 PRODUCT_GATE_MARKER_PREFIX = "<!-- weave-review-loop:product-gate:"
 SUBSTITUTE_SUMMON_MARKER_PREFIX = "<!-- weave-review-loop:substitute-summon:"
 SUBSTITUTE_VERDICT_MARKER_PREFIX = "<!-- weave-review-loop:substitute-verdict:"
+# At equal GitHub timestamps (whole seconds) a findings verdict outranks
+# CLEAN: the substitute channel is appended after Codex, so input order
+# would otherwise let a same-second CLEAN suppress still-standing findings.
+_RESULT_KIND_RANK = {"clean": 0, "findings": 1}
 # head : actor : clean | findings:<p1>:<p2>:<p3>.  The marker — not the prose
 # around it — is the machine contract: substitute reviewers are seats, their
 # prose formats drift, and parsing prose is the defect class the belt audit
@@ -90,6 +96,12 @@ SUBSTITUTE_VERDICT_MARKER_RE = re.compile(
     r"<!-- weave-review-loop:substitute-verdict:"
     rf"([0-9a-fA-F]{{40}}):({SUBSTITUTE_ACTOR_TOKEN}):"
     r"(clean|findings:\d+:\d+:\d+) -->"
+)
+# Writers emit the actor-bearing form. Readers also accept the legacy
+# ``:head -->`` form so in-flight summons keep covering the head.
+SUBSTITUTE_SUMMON_MARKER_RE = re.compile(
+    r"<!-- weave-review-loop:substitute-summon:"
+    rf"([0-9a-fA-F]{{40}})(?::({SUBSTITUTE_ACTOR_TOKEN}))? -->"
 )
 # The connector's account-wide quota refusal (2026-08-16 outage shape).  It is
 # not CODEX_CONNECTOR_ERROR_PREFIX ("To use Codex here"), which is the
@@ -698,19 +710,35 @@ def codex_result_events(
     return events
 
 
+def _result_event_key(
+    event: tuple[datetime, int, str, str],
+) -> tuple[datetime, int, int]:
+    """Time, then conservative kind rank, then input order.
+
+    Findings outrank CLEAN at a timestamp tie so a same-second substitute
+    CLEAN cannot become authoritative over a Codex findings review.
+    """
+    at, order, _head, kind = event
+    return (at, _RESULT_KIND_RANK.get(kind, 0), order)
+
+
 def substitute_verdicts(
     comments: Sequence[Mapping[str, Any]],
 ) -> list[tuple[Mapping[str, Any], dict[str, Any]]]:
     """Trusted substitute exact-head verdicts, as ``(comment, parsed)`` pairs.
 
-    A substitute verdict is a PR comment by a trusted control identity carrying
-    the ``substitute-verdict`` marker.  The marker is the whole contract — full
-    head SHA, the substitute actor, and ``clean`` or ``findings:p1:p2:p3`` —
-    because seats' verdict prose drifts and the loop must never parse it.  An
-    untrusted author's marker is a forgery and never counts, same trust rule as
-    every other control marker.
+    A substitute verdict is a PR comment by a trusted *verdict* identity
+    carrying the ``substitute-verdict`` marker.  That set is narrower than
+    ``trusted_control_logins()``: the workflow bot writes summons, nudges,
+    and gates, but it is not a verdict source — the event-driven job cannot
+    fire for it, so counting its marker would consume the head with no wake.
+    The marker is the whole contract — full head SHA, the substitute actor,
+    and ``clean`` or ``findings:p1:p2:p3`` — because seats' verdict prose
+    drifts and the loop must never parse it.  An untrusted author's marker
+    is a forgery and never counts.
     """
-    trusted = trusted_control_logins()
+    trusted = substitute_verdict_authors()
+    summoned_by_head = _summoned_actors_by_head(comments)
     verdicts: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
     for comment in comments:
         user = comment.get("user")
@@ -718,6 +746,11 @@ def substitute_verdicts(
             continue
         match = SUBSTITUTE_VERDICT_MARKER_RE.search(str(comment.get("body") or ""))
         if match is None:
+            continue
+        head = match.group(1).lower()
+        actor = match.group(2)
+        summoned = summoned_by_head.get(head)
+        if summoned is not None and actor != summoned:
             continue
         counts = {"p1": 0, "p2": 0, "p3": 0}
         if match.group(3) != "clean":
@@ -730,8 +763,8 @@ def substitute_verdicts(
                 comment,
                 {
                     "at": result_event_time(comment.get("created_at")),
-                    "head": match.group(1).lower(),
-                    "actor": match.group(2),
+                    "head": head,
+                    "actor": actor,
                     "kind": "clean" if match.group(3) == "clean" else "findings",
                     "counts": counts,
                 },
@@ -758,6 +791,112 @@ def standing_substitute_findings(
     return latest
 
 
+def substitute_findings_payload(
+    comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> dict[str, Any] | None:
+    """Standing substitute FINDINGS digest for mixed-source wakes, or None."""
+    standing = standing_substitute_findings(comments, head_sha)
+    if standing is None:
+        return None
+    comment, verdict = standing
+    return {
+        "actor": verdict["actor"],
+        "counts": verdict["counts"],
+        "body": str(comment.get("body") or ""),
+    }
+
+
+def _summoned_actors_by_head(
+    comments: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    """Latest trusted summon's actor per head, when the marker recorded one.
+
+    A legacy summon (no actor in the marker) imposes no constraint: the
+    newest actor-bearing summon is the assignment that later verdicts
+    must match.
+    """
+    latest: dict[str, tuple[datetime, str | None]] = {}
+    trusted = trusted_control_logins()
+    for comment in comments:
+        user = comment.get("user")
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
+            continue
+        match = SUBSTITUTE_SUMMON_MARKER_RE.search(str(comment.get("body") or ""))
+        if match is None:
+            continue
+        head = match.group(1).lower()
+        at = result_event_time(comment.get("created_at"))
+        previous = latest.get(head)
+        if previous is None or at >= previous[0]:
+            latest[head] = (at, match.group(2))
+    return {head: actor for head, (_, actor) in latest.items() if actor}
+
+
+def _substitute_verdict_matches_summon(
+    comments: Sequence[Mapping[str, Any]], verdict: Mapping[str, Any]
+) -> bool:
+    """True when no actor-bearing summon binds this head, or the actors match."""
+    summoned = _summoned_actors_by_head(comments).get(str(verdict["head"]))
+    return summoned is None or summoned == verdict["actor"]
+
+
+def _is_workflow_substitute_summon(body: str) -> bool:
+    """True only for the workflow's own summon comment, not a quote of it.
+
+    Summon comments carry the summon marker and do not carry a verdict-marker
+    HTML comment (they may quote the grammar without the ``<!--`` wrapper).
+    A reply that quotes the summon and adds a verdict-marker attempt is a
+    verdict, not a summon.
+    """
+    if SUBSTITUTE_SUMMON_MARKER_PREFIX not in body:
+        return False
+    return SUBSTITUTE_VERDICT_MARKER_PREFIX not in body
+
+
+def _latest_codex_clean_at(
+    issue_comments: Sequence[Mapping[str, Any]] | None,
+    head: str,
+    codex_login: str,
+    repository: str = "",
+) -> datetime | None:
+    """Latest Codex clean-comment timestamp that names this head, if any."""
+    latest: datetime | None = None
+    wanted = str(head).lower().removeprefix(UNRESOLVED_CLEAN_PREFIX)
+    for comment in issue_comments or ():
+        commitish = clean_comment_commitish(comment, codex_login, repository)
+        if commitish is None:
+            continue
+        commitish = commitish.lower()
+        if not (wanted.startswith(commitish) or commitish.startswith(wanted[:7])):
+            continue
+        at = result_event_time(comment.get("created_at"))
+        if latest is None or at > latest:
+            latest = at
+    return latest
+
+
+def clean_verdict_source(
+    comments: Sequence[Mapping[str, Any]],
+    head_sha: str,
+    codex_login: str,
+    *,
+    repository: str = "",
+) -> str:
+    """Who authored the latest CLEAN on this head.
+
+    A later Codex CLEAN outranks a substitute CLEAN. A tie, or a substitute
+    CLEAN with no later Codex CLEAN, keeps the substitute identity — the
+    scheduled redelivery must not invent a Codex audit record.
+    """
+    substitute = _substitute_history_by_head(comments).get(head_sha.lower())
+    if substitute is None or substitute["kind"] != "clean":
+        return "Codex review"
+    codex_clean_at = _latest_codex_clean_at(comments, head_sha, codex_login, repository)
+    if codex_clean_at is not None and codex_clean_at > substitute["at"]:
+        return "Codex review"
+    return f"substitute review (`{substitute['actor']}`)"
+
+
 def result_heads_from_events(
     events: Sequence[tuple[datetime, int, str, str]],
 ) -> list[str]:
@@ -776,7 +915,9 @@ def latest_result_kind_by_head(
     latest: dict[str, tuple[datetime, int, str]] = {}
     for at, order, head, kind in events:
         previous = latest.get(head)
-        if previous is None or (at, order) >= (previous[0], previous[1]):
+        if previous is None or _result_event_key(
+            (at, order, head, kind)
+        ) >= _result_event_key((previous[0], previous[1], head, previous[2])):
             latest[head] = (at, order, kind)
     return {head: kind for head, (_, _, kind) in latest.items()}
 
@@ -908,8 +1049,18 @@ def round_history(
             elif substitute_round is not None and substitute_round["kind"] == "clean":
                 # A substitute CLEAN is not a Codex clean comment: the
                 # retrospective compares reviewer/repair sequences, so false
-                # provenance here is exactly where it misleads.
-                verdict = f"CLEAN (substitute {substitute_round['actor']} verdict)"
+                # provenance here is exactly where it misleads. A later Codex
+                # CLEAN on the same head is the authoritative reviewer.
+                codex_clean_at = _latest_codex_clean_at(
+                    issue_comments, head, codex_login
+                )
+                if (
+                    codex_clean_at is not None
+                    and codex_clean_at > substitute_round["at"]
+                ):
+                    verdict = "CLEAN (Codex clean comment)"
+                else:
+                    verdict = f"CLEAN (substitute {substitute_round['actor']} verdict)"
             else:
                 verdict = "CLEAN (Codex clean comment)"
             findings = []
@@ -944,6 +1095,9 @@ def round_history(
             verdict = "findings review"
             counts = severity_counts(findings)
             locations = [history_location(finding) for finding in findings]
+            mixed = substitute_by_head.get(str(head).lower())
+            if mixed is not None and mixed["kind"] == "findings":
+                digest = str(mixed["body"])
         else:
             verdict = (
                 "findings review submitted, 0 inline comments retrievable "
@@ -951,6 +1105,10 @@ def round_history(
             )
             counts = severity_counts(findings)
             locations = []
+            mixed = substitute_by_head.get(str(head).lower())
+            if mixed is not None and mixed["kind"] == "findings":
+                digest = str(mixed["body"])
+                counts = dict(mixed["counts"])
         history.append(
             {
                 "round": index,
@@ -1111,32 +1269,44 @@ def head_base_comment_body(head_sha: str, base_ref: str, base_sha: str) -> str:
     )
 
 
-def recorded_head_bases(comments: Sequence[Mapping[str, Any]]) -> dict[str, str]:
-    """Trusted pins of each reviewed head's contemporaneous base SHA.
+def _trusted_head_base_pins(
+    comments: Sequence[Mapping[str, Any]],
+) -> dict[str, tuple[str | None, str]]:
+    """Trusted pins of each reviewed head as ``(base_ref or None, base_sha)``.
 
-    First pin for a head wins: that is the base that was live when the
-    verdict was first accepted. A later force-push of the target does not
-    rewrite the series bound. Both marker generations are read; a v2 pin and
-    a legacy pin for the same head keep whichever came first in comment order.
+    A later pin with a *different* ref replaces the earlier one: that is a
+    fresh exact-head verdict after a retarget, and the old pin would make
+    every later CLEAN refuse closure against the new target. A later pin
+    with the *same* ref is ignored — a force-push of the target tip must
+    not rewrite the series bound. Legacy pins carry no ref; a later v2 pin
+    upgrades them, and a later legacy pin never replaces a v2 pin.
     """
     trusted = trusted_control_logins()
-    bases: dict[str, str] = {}
+    pins: dict[str, tuple[str | None, str]] = {}
     for comment in comments:
         user = comment.get("user")
         if not isinstance(user, Mapping) or user.get("login") not in trusted:
             continue
         body = str(comment.get("body") or "")
         for v2 in HEAD_BASE_MARKER_V2_RE.finditer(body):
-            head, _ref, base = v2.groups()
-            if head not in bases:
-                bases[head] = base
+            head, ref, base = v2.groups()
+            previous = pins.get(head)
+            if previous is None or previous[0] is None or previous[0] != ref:
+                pins[head] = (ref, base)
         for match in HEAD_BASE_MARKER_RE.finditer(body):
             head, base = match.group(1), match.group(2)
             if head == MARKER_SCHEMA_VERSION:
                 continue  # the first two segments of a v2 pin, not a legacy pin
-            if head not in bases:
-                bases[head] = base
-    return bases
+            if head not in pins:
+                pins[head] = (None, base)
+    return pins
+
+
+def recorded_head_bases(comments: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """Trusted pins of each reviewed head's contemporaneous base SHA."""
+    return {
+        head: sha for head, (_ref, sha) in _trusted_head_base_pins(comments).items()
+    }
 
 
 def recorded_head_base_refs(comments: Sequence[Mapping[str, Any]]) -> dict[str, str]:
@@ -1145,17 +1315,11 @@ def recorded_head_base_refs(comments: Sequence[Mapping[str, Any]]) -> dict[str, 
     Only v2 pins carry a ref; a legacy pin contributes nothing here, so the
     closure predicate treats its head as having no recorded ref to compare.
     """
-    trusted = trusted_control_logins()
-    refs: dict[str, str] = {}
-    for comment in comments:
-        user = comment.get("user")
-        if not isinstance(user, Mapping) or user.get("login") not in trusted:
-            continue
-        for v2 in HEAD_BASE_MARKER_V2_RE.finditer(str(comment.get("body") or "")):
-            head, ref, _base = v2.groups()
-            if head not in refs:
-                refs[head] = ref
-    return refs
+    return {
+        head: ref
+        for head, (ref, _sha) in _trusted_head_base_pins(comments).items()
+        if ref
+    }
 
 
 def stale_base_ref_for_closure(
@@ -1198,7 +1362,10 @@ def base_retarget_after(
         created = str(event.get("created_at") or "")
         # An undated verdict sorts to datetime.min, so any retarget event
         # refuses closure — the safe direction for an unwitnessable subject.
-        if created and result_event_time(created) > verdict_at:
+        # GitHub stamps events to whole seconds: a retarget in the same
+        # second as the verdict is ambiguous, so treat the tie as "after"
+        # and refuse — the safe direction.
+        if created and result_event_time(created) >= verdict_at:
             return created
     return None
 
@@ -1215,19 +1382,21 @@ def record_reviewed_head_base(
 ) -> str:
     """Persist the base that was live when this head was reviewed.
 
-    Deduplicates by head, not by ``(head, base)``: the first accepted pin
-    is the contemporaneous one. A later pin after the target moved would
-    record the wrong series bound.
+    Same-ref pins stay first-wins so a later tip movement does not rewrite
+    the series bound. A later verdict against a *different* ref replaces
+    the pin — that is the fresh exact-head review requested after a
+    retarget, and keeping the old pin would refuse every later CLEAN.
     """
     existing = comments
     if existing is None:
         existing = github.paginate(f"issues/{pr_number}/comments")
-    if marker_comment_exists(existing, head_base_marker_for(head_sha)):
+    previous = _trusted_head_base_pins(existing).get(head_sha)
+    if previous is not None and previous[0] == base_ref:
         return "existing"
     return ensure_comment_at_head(
         github,
         pr_number,
-        head_base_marker_for(head_sha),
+        head_base_marker(head_sha, base_ref, base_sha),
         head_base_comment_body(head_sha, base_ref, base_sha),
         expected_head=head_sha,
         repository=repository,
@@ -1375,6 +1544,19 @@ def trusted_control_logins() -> frozenset[str]:
     if author:
         logins.append(author)
     return frozenset(login for login in logins if login)
+
+
+def substitute_verdict_authors() -> frozenset[str]:
+    """Identities allowed to author a substitute verdict marker.
+
+    Distinct from ``trusted_control_logins()``. The workflow bot posts
+    summons, nudges, and gates; it is not a verdict source. The
+    event-driven job filter only admits ``CODEX_REVIEW_AUTHOR``, so a
+    marker from any other trusted control identity would consume the
+    head without ever waking the author, Talos, or the exhaustion path.
+    """
+    author = os.environ.get("CODEX_REVIEW_AUTHOR")
+    return frozenset([author] if author else [])
 
 
 def marker_comment_exists(
@@ -1557,13 +1739,16 @@ def build_burn_messages(
     history: Sequence[Mapping[str, Any]] | None = None,
     substitute: Mapping[str, Any] | None = None,
 ) -> list[str]:
+    substitute_is_primary = substitute is not None and str(review_state).startswith(
+        "substitute-"
+    )
     if substitute is None:
         counts = severity_counts(findings)
         verdict = (
             f"Codex findings: {counts['p1']} P1 / {counts['p2']} P2 / "
             f"{counts['p3']} P3 (review state: {review_state})."
         )
-    else:
+    elif substitute_is_primary:
         # A substitute verdict: counts come from the marker (deterministic),
         # and the digest is the substitute's verdict comment verbatim — the
         # loop never re-parses seat prose into structured findings.
@@ -1576,9 +1761,19 @@ def build_burn_messages(
         if findings:
             verdict += (
                 f" This head also carries {len(findings)} Codex inline "
-                "finding(s) from an earlier review — included below; burn "
-                "the union."
+                "finding(s) — included below; burn the union."
             )
+    else:
+        # Codex is the later source; still-standing substitute findings ride
+        # in the same wake. Only a CLEAN verdict clears earlier same-head
+        # findings, so inverse ordering must not drop the substitute digest.
+        counts = severity_counts(findings)
+        verdict = (
+            f"Codex findings: {counts['p1']} P1 / {counts['p2']} P2 / "
+            f"{counts['p3']} P3 (review state: {review_state}). This head "
+            f"also carries a substitute ({substitute['actor']}) findings "
+            "digest — included below; burn the union."
+        )
     evidence_heading = (
         "## Per-round history, then the current head's findings\n"
         if history
@@ -2124,6 +2319,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
             author_actor=author_actor,
             review_round=review_round,
             pr_number=pr_number,
+            substitute=substitute_findings_payload(conversation_comments, head_sha),
         )
         return
 
@@ -2150,6 +2346,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         has_merge_on_green=has_merge_on_green,
         review_round=review_round,
         history=history,
+        substitute=substitute_findings_payload(conversation_comments, head_sha),
     )
     post_threaded_messages(slack, messages)
     print(
@@ -2392,6 +2589,17 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
     conversation_comments = github.paginate(f"issues/{pr_number}/comments")
+    if not _substitute_verdict_matches_summon(
+        [*conversation_comments, comment], verdict
+    ):
+        summoned = _summoned_actors_by_head([*conversation_comments, comment]).get(
+            verdict["head"]
+        )
+        raise RuntimeError(
+            "substitute verdict actor does not match the summoned seat "
+            f"(verdict={verdict['actor']}, summoned={summoned}, "
+            f"head={verdict['head']})"
+        )
     reviewed_heads = codex_result_heads(
         github, reviews, [*conversation_comments, comment], codex_login
     )
@@ -2521,20 +2729,28 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             )
             return
         review_comments = github.paginate(f"pulls/{pr_number}/comments")
+        result_events = codex_result_events(
+            github, reviews, [*conversation_comments, comment], codex_login
+        )
+        standing_codex: list[dict[str, Any]] = []
+        for standing_review in same_head_findings_reviews_since_clean(
+            reviews, result_events, head_sha, codex_login
+        ):
+            standing_codex.extend(
+                review_findings(
+                    review_comments, int(standing_review["id"]), codex_login
+                )
+            )
         history = round_history(
             reviewed_heads,
             reviews,
             review_comments,
             codex_login,
-            latest_kind_by_head=latest_result_kind_by_head(
-                codex_result_events(
-                    github, reviews, [*conversation_comments, comment], codex_login
-                )
-            ),
+            latest_kind_by_head=latest_result_kind_by_head(result_events),
             issue_comments=[*conversation_comments, comment],
         )
         messages = build_burn_messages(
-            findings=[],
+            findings=standing_codex,
             review_state=f"substitute-findings:{verdict['actor']}",
             word=word,
             pr_url=pr_url,
@@ -2618,15 +2834,17 @@ def route_comment_event(event: Mapping[str, Any]) -> None:
         author != codex_login
         and author in trusted_control_logins()
         and "weave-review-loop:substitute-verdict:" in body
-        and SUBSTITUTE_SUMMON_MARKER_PREFIX not in body
+        and not _is_workflow_substitute_summon(body)
     ):
         # A trusted substitute tried to post a verdict and the marker
         # does not parse. Falling through to the clean-comment path
         # ignores it silently while the standing summon marker suppresses
         # every scheduled retry — a permanently unreviewed head. R-3:
         # terminalize loudly so the malformed verdict is visible and the
-        # substitute can repost the marker verbatim. (Summon comments
-        # quote the marker grammar and are excluded by their own marker.)
+        # substitute can repost the marker verbatim. Distinguish the
+        # workflow's own summon by shape: it carries the summon marker
+        # and never a verdict-marker HTML comment. A reply that quotes
+        # the summon and adds a verdict-marker attempt is a verdict.
         raise RuntimeError(
             "trusted substitute verdict marker does not parse "
             f"(author={author}); repost the verdict with the marker "
@@ -2789,8 +3007,10 @@ def same_head_findings_reviews_since_clean(
     """Exact-head findings reviews still standing after the latest CLEAN.
 
     A later findings review does not resolve earlier comments on the same SHA.
-    Only a CLEAN verdict (or a new head) does.  Reviews submitted at or before
-    the latest CLEAN on this head are dropped; everything after it is kept.
+    Only a CLEAN verdict (or a new head) does.  Reviews submitted before
+    the latest CLEAN on this head are dropped; a same-second findings
+    review is kept — GitHub stamps only to whole seconds, and a tie must
+    not let CLEAN suppress still-standing findings.
     """
     wanted = head_sha.lower()
     last_clean_at: datetime | None = None
@@ -2801,7 +3021,7 @@ def same_head_findings_reviews_since_clean(
     for review in exact_head_codex_reviews(reviews, head_sha, codex_login):
         if (
             last_clean_at is not None
-            and result_event_time(review.get("submitted_at")) <= last_clean_at
+            and result_event_time(review.get("submitted_at")) < last_clean_at
         ):
             continue
         standing.append(review)
@@ -3008,6 +3228,9 @@ def redeliver_standing_wake(
                 word=word,
                 pr_url=pr_url,
                 branch=branch,
+                verdict_source=clean_verdict_source(
+                    comments, head_sha, codex_login, repository=repository
+                ),
             )
         ]
     else:
@@ -3021,10 +3244,17 @@ def redeliver_standing_wake(
             latest_kind_by_head=latest_result_kind_by_head(result_events),
             issue_comments=comments,
         )
-        # Mixed sources on one head (Codex inline findings AND a later
-        # substitute verdict): the latest source is the primary verdict, and
-        # the other source's digest still rides in the same wake — the burn
-        # seat must never act on a partial evidence set.
+        # Mixed sources on one head (Codex inline findings AND a
+        # substitute verdict, either order): the latest source is the
+        # primary verdict, and the other source's digest still rides in
+        # the same wake — only a CLEAN verdict clears earlier same-head
+        # findings. Inverse ordering (substitute first, Codex second)
+        # must not drop the still-standing substitute payload.
+        substitute_payload = (
+            substitute_findings_payload(comments, head_sha)
+            if substitute_standing is not None
+            else None
+        )
         substitute_is_latest = substitute_standing is not None and (
             latest_review is None
             or substitute_standing[1]["at"]
@@ -3033,16 +3263,9 @@ def redeliver_standing_wake(
         if findings and not substitute_is_latest:
             assert latest_review is not None
             review_state = str(latest_review.get("state") or "unknown")
-            substitute_payload = None
         else:
             assert substitute_standing is not None
-            substitute_comment, substitute_verdict_parsed = substitute_standing
-            review_state = f"substitute-findings:{substitute_verdict_parsed['actor']}"
-            substitute_payload = {
-                "actor": substitute_verdict_parsed["actor"],
-                "counts": substitute_verdict_parsed["counts"],
-                "body": str(substitute_comment.get("body") or ""),
-            }
+            review_state = f"substitute-findings:{substitute_standing[1]['actor']}"
         messages = build_burn_messages(
             findings=findings,
             review_state=review_state,
@@ -3123,6 +3346,19 @@ def usage_meter_reading() -> dict[str, Any] | None:
         if candidate.get("provider") != "codex":
             continue
         if pool_name and pool_name not in (candidate.get("id"), candidate.get("label")):
+            continue
+        # Retained windows survive a dead collector. Status and sampled_at
+        # are the aggregator's "this reading is current" signal; a stale /
+        # auth_expired / error pool after a quota reset would otherwise keep
+        # routing every new review to the substitute forever. Missing or
+        # unparseable freshness fields are the same as degraded: skip the
+        # pool, and if every pool is skipped the meter is absent (fail-open).
+        if candidate.get("status") != "ok":
+            continue
+        sampled_at = candidate.get("sampled_at")
+        if not isinstance(sampled_at, str) or not sampled_at.strip():
+            continue
+        if result_event_time(sampled_at) == datetime.min.replace(tzinfo=timezone.utc):
             continue
         windows = candidate.get("windows")
         if not isinstance(windows, Sequence):
@@ -3281,14 +3517,27 @@ def find_half_route(
     )
 
 
-def substitute_summon_marker(head_sha: str) -> str:
+def substitute_summon_marker(head_sha: str, actor: str | None = None) -> str:
+    """Summon marker. Writers pass ``actor``; readers accept the legacy form."""
+    if actor:
+        return f"{SUBSTITUTE_SUMMON_MARKER_PREFIX}{head_sha}:{actor} -->"
     return f"{SUBSTITUTE_SUMMON_MARKER_PREFIX}{head_sha} -->"
 
 
 def substitute_summon_covers_head(
     comments: Sequence[Mapping[str, Any]], head_sha: str
 ) -> bool:
-    return marker_comment_exists(comments, substitute_summon_marker(head_sha))
+    """True when a trusted summon — legacy or actor-bearing — covers this head."""
+    wanted = head_sha.lower()
+    trusted = trusted_control_logins()
+    for comment in comments:
+        user = comment.get("user")
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
+            continue
+        match = SUBSTITUTE_SUMMON_MARKER_RE.search(str(comment.get("body") or ""))
+        if match is not None and match.group(1).lower() == wanted:
+            return True
+    return False
 
 
 def substitute_verdict_marker_line(head_sha: str, actor: str) -> str:
@@ -3315,8 +3564,125 @@ def substitute_summon_comment_body(
         f"Review-loop router: summoned substitute reviewer `{actor}` for head "
         f"`{head_sha}` (round {review_round}/{MAX_REVIEW_ROUNDS}).\n"
         f"Route reason: {reason}.\n"
-        f"{substitute_summon_marker(head_sha)}"
+        f"{substitute_summon_marker(head_sha, actor)}"
     )
+
+
+_SUMMON_ROUTE_REASON_RE = re.compile(r"^Route reason: (.+)\.\s*$", re.MULTILINE)
+
+
+def standing_substitute_summon(
+    comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> dict[str, Any] | None:
+    """Latest trusted summon covering this head, or ``None``.
+
+    A comment with no parseable ``created_at`` cannot start the stall
+    window and is not a redelivery candidate — GitHub always stamps
+    comments, and inventing an age would re-wake a covered head on
+    every scan.
+    """
+    wanted = head_sha.lower()
+    trusted = trusted_control_logins()
+    latest: dict[str, Any] | None = None
+    undated = datetime.min.replace(tzinfo=timezone.utc)
+    for comment in comments:
+        user = comment.get("user")
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
+            continue
+        body = str(comment.get("body") or "")
+        match = SUBSTITUTE_SUMMON_MARKER_RE.search(body)
+        if match is None or match.group(1).lower() != wanted:
+            continue
+        at = result_event_time(comment.get("created_at"))
+        if at == undated:
+            continue
+        if latest is not None and at < latest["at"]:
+            continue
+        reason_match = _SUMMON_ROUTE_REASON_RE.search(body)
+        latest = {
+            "at": at,
+            "actor": match.group(2),
+            "reason": (
+                reason_match.group(1)
+                if reason_match
+                else "standing substitute assignment"
+            ),
+        }
+    return latest
+
+
+def redeliver_stalled_substitute_summon(
+    github: GitHubApi,
+    *,
+    pull_request: Mapping[str, Any],
+    pr_number: int,
+    head_sha: str,
+    comments: Sequence[Mapping[str, Any]],
+    reviewed_heads: Sequence[str],
+    repository: str,
+    now: datetime,
+) -> bool:
+    """Re-deliver an existing substitute assignment after the stall window.
+
+    Ownership stays with the summoned actor. This posts no second summon
+    marker and adds no review round — attention only, the same contract
+    as standing-verdict redelivery.
+    """
+    summon = standing_substitute_summon(comments, head_sha)
+    if summon is None:
+        return False
+    if (now - summon["at"]).total_seconds() < WAKE_REDELIVERY_SECONDS:
+        return False
+    stamp = summon["at"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if marker_comment_exists(
+        comments,
+        (
+            redelivery_marker(head_sha, stamp),
+            legacy_redelivery_marker(head_sha, stamp),
+        ),
+    ):
+        return False
+    actor = summon["actor"] or substitute_actor()
+    pr_state = refresh_pr_at_head(
+        github,
+        pr_number,
+        head_sha,
+        repository,
+        action="substitute summon redelivery",
+    )
+    if pr_state is None:
+        return False
+    if str(pr_state.get("state") or "") != "open":
+        print(
+            f"ignored substitute summon redelivery for a closed "
+            f"{repository}#{pr_number} (head={head_sha})"
+        )
+        return False
+    refreshed_head = pr_state.get("head")
+    if not isinstance(refreshed_head, Mapping):
+        raise TypeError("live pull_request.head is missing")
+    slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
+    slack.post_message(
+        f"{redelivery_notice(stamp)}\n\n"
+        + substitute_review_wake_message(
+            actor=actor,
+            reason=str(summon["reason"]),
+            pr_url=str(pr_state.get("html_url") or pull_request.get("html_url") or ""),
+            branch=str(refreshed_head.get("ref") or "unknown"),
+            head_sha=head_sha,
+            review_round=result_round_for_head(reviewed_heads, head_sha),
+            repository=repository,
+        )
+    )
+    github.post(
+        f"issues/{pr_number}/comments",
+        {"body": redelivery_comment_body(head_sha, stamp)},
+    )
+    print(
+        f"re-delivered substitute summon for {repository}#{pr_number} "
+        f"(head={head_sha}, actor={actor}, summoned_at={stamp})"
+    )
+    return True
 
 
 def substitute_review_wake_message(
@@ -3443,8 +3809,21 @@ def _scan_open_pull(
         return (0, 0, 0)
     # A standing substitute summon owns the head in both directions: it is an
     # assignment to a seat, and recomputing ownership when the meter moves
-    # would post a second reviewer against the same exact head.
+    # would post a second reviewer against the same exact head. A summon
+    # whose seat never posted a verdict is still a stall — re-deliver the
+    # existing assignment after the same window standing verdicts use.
     if substitute_summon_covers_head(comments, head_sha):
+        if redeliver_stalled_substitute_summon(
+            github,
+            pull_request=pull_request,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            comments=comments,
+            reviewed_heads=reviewed_heads,
+            repository=repository,
+            now=now,
+        ):
+            return (0, 0, 1)
         return (0, 0, 0)
     # A bare Codex nudge owns the head only while Codex has not refused it.
     # Treating the nudge marker as unconditional coverage is a permanent
