@@ -17,9 +17,11 @@ export interface ServerStore {
   probeReady(at: string): void;
   conflictCount(): number;
   recordIdentityKeyMismatch(
+    observationId: string,
     profileId: string,
     edgeId: string,
     presentedKeyId: string,
+    expectedKeyId: string,
     at: string,
   ): void;
   identityKeyMismatchCount(): number;
@@ -280,9 +282,11 @@ export function createApp(options: AppOptions): UsageApp {
             // several apparently verified pools. Reject loudly with the two
             // non-secret identifiers so the operator can fix provisioning.
             options.store.recordIdentityKeyMismatch(
+              observation.observation_id,
               observation.profile_id,
               observation.edge_id,
               observation.identity_key_id,
+              expectedKeyId,
               currentIso,
             );
             log(

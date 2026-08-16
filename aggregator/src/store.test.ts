@@ -155,6 +155,27 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("a same-instance sequence regression is ignored but named per-profile", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({ sequence: 318, windows: windows(0.5) }), "2026-08-15T15:30:01Z");
+
+    // Same installation generation, NEW observation id, regressed counter —
+    // the signature of a sequence file lost to an unclean shutdown (written
+    // sync=false by budgeted design). The observation stays ignored, but the
+    // collector would otherwise be silently stranded until its counter
+    // climbs back past the server's mark: the doctor must name it.
+    const regressed = store.ingest(observation({
+      sequence: 3,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.6),
+    }), "2026-08-15T15:31:02Z");
+    expect(regressed.outcome).toBe("ignored");
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.last_conflict?.kind).toBe("sequence_regression");
+    store.close();
+  });
+
   test("a fresh installation generation restarts its sequence legitimately", async () => {
     const { store } = await freshStore();
     // The old installation reached sequence 318.

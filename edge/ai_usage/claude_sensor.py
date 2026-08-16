@@ -118,7 +118,9 @@ def claude_statusline(
             quality = "transcript_mtime"
     resolved_sequence = sequence() if callable(sequence) else sequence
     resolved_instance = (
-        observer_instance_id() if callable(observer_instance_id) else observer_instance_id
+        observer_instance_id()
+        if callable(observer_instance_id)
+        else observer_instance_id
     )
     observation = make_observation(
         config,

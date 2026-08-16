@@ -214,15 +214,42 @@ export class UsageStore {
     return row?.count ?? 0;
   }
 
-  /** A rejected wrong-namespace observation is loud, durable evidence. */
+  /** A rejected wrong-namespace observation is loud, durable evidence.
+   *
+   * Evidence lands in BOTH places: the global counter/record for the fleet
+   * view, and a per-profile conflicts row so the per-profile doctor names
+   * the affected collector — a mismatch never reaches `ingest`, so without
+   * this row the profile would keep projecting its last good observation
+   * while being 100% rejected.
+   */
   recordIdentityKeyMismatch(
+    observationId: string,
     profileId: string,
     edgeId: string,
     presentedKeyId: string,
+    expectedKeyId: string,
     at: string,
   ): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      this.db.query(`
+        INSERT INTO conflicts (
+          observation_id, profile_id, kind, hinted_pool_id,
+          matched_pool_id, created_at, evidence_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        observationId,
+        profileId,
+        "identity_key_mismatch",
+        null,
+        null,
+        at,
+        JSON.stringify({
+          edge_id: edgeId,
+          presented_key_id: presentedKeyId,
+          expected_key_id: expectedKeyId,
+        }),
+      );
       const current = Number(
         this.db.query<{ value: string }, [string]>(
           "SELECT value FROM metadata WHERE key = ?",
@@ -710,6 +737,19 @@ export class UsageStore {
       sameInstance &&
       observation.sequence <= sequence.last_sequence
     ) {
+      // The duplicate check above already returned for a re-sent observation
+      // id, so this is a NEW observation carrying a regressed counter — the
+      // same-instance signature of a sequence file lost to an unclean
+      // shutdown (the edge writes it sync=false by budgeted design). The
+      // observation stays ignored, but silently stranding the collector for
+      // however long the counter takes to climb back is not acceptable
+      // evidence-wise: record the regression per-profile so the doctor names
+      // it.
+      this.recordConflict(observation, "sequence_regression", null, null, receivedAt, {
+        observation_sequence: observation.sequence,
+        last_sequence: sequence.last_sequence,
+        observer_instance_id: observation.observer_instance_id,
+      });
       this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
       return {
         observation_id: observation.observation_id,

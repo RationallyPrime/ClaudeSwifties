@@ -408,6 +408,14 @@ describe("schema-3 HTTP server", () => {
       edge_id: "edge-linux",
       presented_key_id: "Zz9y8X7w6V5u4T3s",
     });
+    // The mismatch never reaches ingest, so without a per-profile conflicts
+    // row the affected collector would keep projecting its last good
+    // observation while being 100% rejected. The doctor must name it.
+    const profiles = body.profiles as Array<Record<string, unknown>>;
+    const affected = profiles.find((row) => row.profile_id === "desktop-a");
+    expect(affected?.last_conflict).toMatchObject({
+      kind: "identity_key_mismatch",
+    });
     store.close();
   });
 });

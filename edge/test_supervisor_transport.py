@@ -534,3 +534,74 @@ class SupervisorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PermanentRejectionTests(unittest.TestCase):
+    def test_permanent_422_is_quarantined_and_the_drain_continues(self):
+        """A content verdict (400/413/422) must not head-of-line block the
+        spool: the observation is quarantined as evidence and the ones
+        behind it still deliver — the cutover wedge Theoros reproduced."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            first, second = observation(config, 1), observation(config, 2)
+            spool.enqueue(first)
+            spool.enqueue(second)
+            transport = RecordingTransport(
+                failures=[DeliveryFailure("namespace", status=422), None]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            state = RuntimeState()
+            self.assertEqual(supervisor._drain(state, 1000), 1)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 0)
+            self.assertEqual(stats["rejected"], 1)
+            self.assertFalse(config.retry_path.exists())
+            reasons = list(spool.rejected_dir.glob("*.reason.json"))
+            self.assertEqual(len(reasons), 1)
+            self.assertIn("422", reasons[0].read_text())
+
+    def test_transient_503_still_backs_off_and_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[DeliveryFailure("unavailable", status=503)]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            state = RuntimeState()
+            self.assertEqual(supervisor._drain(state, 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
+            self.assertTrue(config.retry_path.exists())
+
+    def test_unparseable_spooled_file_is_quarantined_not_wedging(self):
+        """A pre-upgrade spool file the collector can no longer parse is a
+        permanent fact about that file; pending() quarantines it and yields
+        the deliverable remainder instead of raising."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            old_shape, good = observation(config, 1), observation(config, 2)
+            spool.enqueue(old_shape)
+            spool.enqueue(good)
+            first_path = spool._paths()[0]
+            stale = json.loads(first_path.read_text())
+            del stale["observer_instance_id"]
+            del stale["identity_key_id"]
+            first_path.write_text(json.dumps(stale))
+
+            pending = list(spool.pending())
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].observation.observation_id, good.observation_id)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 1)
+
+            # The whole tick still completes: drain delivers the good one.
+            transport = RecordingTransport()
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 1)
+            self.assertEqual(spool.stats()["pending"], 0)

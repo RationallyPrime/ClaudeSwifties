@@ -31,6 +31,13 @@ from .util import (
 
 DIAGNOSTIC_LIMIT = 64 * 1024
 
+# Statuses that are verdicts about an observation's CONTENT — a malformed
+# payload (400), an oversize one (413), or a namespace rejection (422).
+# Everything else (401/403 credential rotation, 408/429 pressure, 5xx,
+# network) stays on the transient backoff path: retrying those is harmless,
+# retrying these wedges the spool head forever.
+PERMANENT_REJECTION_STATUSES = frozenset({400, 413, 422})
+
 
 @dataclasses.dataclass
 class RuntimeState:
@@ -417,6 +424,25 @@ class Supervisor:
             try:
                 acknowledgement = self.transport.send(pending.observation)
             except DeliveryFailure as error:
+                if error.status in PERMANENT_REJECTION_STATUSES:
+                    # A content verdict about THIS observation (schema or
+                    # namespace rejection), not a transient transport state:
+                    # retrying can never succeed, and backing off head-of-line
+                    # blocks every observation behind it — the wedge Theoros
+                    # reproduced on the identity-key 422. Quarantine and keep
+                    # draining.
+                    self.spool.quarantine(
+                        pending.path,
+                        f"permanently rejected by the aggregator: HTTP {error.status}",
+                    )
+                    retry = {}
+                    self.config.retry_path.unlink(missing_ok=True)
+                    self.diagnostics.write(
+                        "delivery_rejected_permanent",
+                        observation_id=pending.observation.observation_id,
+                        status=error.status,
+                    )
+                    continue
                 previous_attempt = (
                     retry.get("attempt")
                     if retry.get("observation_id") == pending.observation.observation_id

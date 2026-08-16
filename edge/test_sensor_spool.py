@@ -189,8 +189,10 @@ class ObserverInstanceTests(unittest.TestCase):
             self.assertEqual(mode, 0o600)
 
     def test_fresh_state_dir_is_a_new_installation_generation(self):
-        with tempfile.TemporaryDirectory() as first, \
-                tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             first_id = ObserverInstance(make_config(Path(first))).read_or_create()
             second_id = ObserverInstance(make_config(Path(second))).read_or_create()
             self.assertNotEqual(first_id, second_id)

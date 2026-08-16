@@ -11,7 +11,6 @@ from typing import Any
 
 from .util import normalize_identity
 
-
 IDENTITY_KEY_NAMESPACE = b"ai-usage-identity-namespace/v1"
 
 
