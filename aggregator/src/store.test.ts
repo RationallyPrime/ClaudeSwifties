@@ -347,6 +347,45 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("doctor latest binding breaks last_seen_at ties by update order", async () => {
+    const { store } = await freshStore();
+    const observedAt = "2026-08-15T15:30:00Z";
+    expect(store.ingest(observation({
+      session_id: "session-old",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      sampled_at: "2026-08-15T15:29:58Z",
+      observed_at: observedAt,
+      windows: windows(0.2),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+    expect(store.ingest(observation({
+      session_id: "session-new",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:29:58Z",
+      observed_at: observedAt,
+      windows: windows(0.4, "2026-08-15T19:00:00Z"),
+    }), "2026-08-15T15:30:02Z").outcome).toBe("conflict");
+
+    // Older-created session updated after the newer-created one, same
+    // last_seen_at. Creation-order rowid would keep reporting session-new's
+    // pool; update order must follow the later write. Bindings still persist
+    // on the conflict path.
+    expect(store.ingest(observation({
+      session_id: "session-old",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:29:59Z",
+      observed_at: observedAt,
+      windows: windows(0.21),
+    }), "2026-08-15T15:30:03Z").outcome).toBe("conflict");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:31:00Z");
+    expect(doctor[0]?.pool_id?.endsWith(SUBJECT_A)).toBe(true);
+    expect(doctor[0]?.binding_confidence).toBe("subject");
+    store.close();
+  });
+
   test("doctor latest observation breaks received_at ties by insertion order", async () => {
     const { store } = await freshStore();
     const receivedAt = "2026-08-15T15:30:01.000Z";

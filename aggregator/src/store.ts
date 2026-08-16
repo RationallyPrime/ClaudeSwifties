@@ -113,6 +113,7 @@ interface BindingRow {
   source_host: string;
   last_seen_at: string;
   binding_confidence: BindingConfidence;
+  update_ordinal: number;
 }
 
 type ReconciliationDecision =
@@ -166,9 +167,9 @@ export class UsageStore {
 
     const bindings = this.db.query<BindingRow, []>(`
       SELECT profile_id, session_key, provider, pool_id, label, source_host,
-             last_seen_at, binding_confidence
+             last_seen_at, binding_confidence, update_ordinal
       FROM bindings
-      ORDER BY last_seen_at DESC, profile_id ASC
+      ORDER BY last_seen_at DESC, update_ordinal DESC, profile_id ASC
     `).all();
 
     const profilesByPool = new Map<string, Map<string, PoolProfile>>();
@@ -421,7 +422,7 @@ export class UsageStore {
       SELECT b.profile_id, b.pool_id, b.binding_confidence, b.last_seen_at
       FROM bindings b
       JOIN (
-        SELECT profile_id, MAX(rowid) AS rowid
+        SELECT profile_id, MAX(update_ordinal) AS update_ordinal
         FROM bindings
         WHERE (profile_id, last_seen_at) IN (
           SELECT profile_id, MAX(last_seen_at)
@@ -429,7 +430,8 @@ export class UsageStore {
           GROUP BY profile_id
         )
         GROUP BY profile_id
-      ) newest ON newest.rowid = b.rowid
+      ) newest ON newest.profile_id = b.profile_id
+        AND newest.update_ordinal = b.update_ordinal
     `).all();
     const bindingByProfile = new Map(bindings.map((row) => [row.profile_id, row]));
 
@@ -618,6 +620,7 @@ export class UsageStore {
         source_host TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         binding_confidence TEXT NOT NULL,
+        update_ordinal INTEGER NOT NULL,
         PRIMARY KEY (profile_id, session_key)
       );
 
@@ -688,6 +691,19 @@ export class UsageStore {
 
       PRAGMA user_version = 5;
     `);
+
+    const bindingSchema = this.db.query<{ sql: string }, [string]>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get("bindings")?.sql;
+    if (bindingSchema && !bindingSchema.includes("update_ordinal")) {
+      // Bindings are updated in place, so rowid stays creation order. Existing
+      // rows keep their relative creation order; later writes mint a new
+      // ordinal past that range.
+      this.db.exec(`
+        ALTER TABLE bindings ADD COLUMN update_ordinal INTEGER NOT NULL DEFAULT 0;
+        UPDATE bindings SET update_ordinal = rowid;
+      `);
+    }
   }
 
   /**
@@ -951,7 +967,7 @@ export class UsageStore {
 
     const existingBinding = this.db.query<BindingRow, [string, string]>(`
       SELECT profile_id, session_key, provider, pool_id, label, source_host,
-             last_seen_at, binding_confidence
+             last_seen_at, binding_confidence, update_ordinal
       FROM bindings WHERE profile_id = ? AND session_key = ?
     `).get(observation.profile_id, sessionKey);
 
@@ -1463,18 +1479,22 @@ export class UsageStore {
     const lastSeen = previous && Date.parse(previous.last_seen_at) > Date.parse(observation.observed_at)
       ? previous.last_seen_at
       : observation.observed_at;
+    const updateOrdinal = (this.db.query<{ n: number }, []>(
+      "SELECT COALESCE(MAX(update_ordinal), 0) + 1 AS n FROM bindings",
+    ).get()?.n ?? 1);
     this.db.query(`
       INSERT INTO bindings (
         profile_id, session_key, provider, pool_id, label, source_host,
-        last_seen_at, binding_confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        last_seen_at, binding_confidence, update_ordinal
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(profile_id, session_key) DO UPDATE SET
         provider = excluded.provider,
         pool_id = excluded.pool_id,
         label = excluded.label,
         source_host = excluded.source_host,
         last_seen_at = excluded.last_seen_at,
-        binding_confidence = excluded.binding_confidence
+        binding_confidence = excluded.binding_confidence,
+        update_ordinal = excluded.update_ordinal
     `).run(
       observation.profile_id,
       sessionKey,
@@ -1484,6 +1504,7 @@ export class UsageStore {
       observation.source_host,
       lastSeen,
       confidence,
+      updateOrdinal,
     );
   }
 
