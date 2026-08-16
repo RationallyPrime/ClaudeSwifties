@@ -375,11 +375,15 @@ export class UsageStore {
       SELECT o.profile_id, o.sampled_at, o.outcome, o.payload_json
       FROM observations o
       JOIN (
-        SELECT profile_id, MAX(received_at) AS received_at
-        FROM observations GROUP BY profile_id
-      ) newest ON newest.profile_id = o.profile_id
-        AND newest.received_at = o.received_at
-      GROUP BY o.profile_id
+        SELECT profile_id, MAX(rowid) AS rowid
+        FROM observations
+        WHERE (profile_id, received_at) IN (
+          SELECT profile_id, MAX(received_at)
+          FROM observations
+          GROUP BY profile_id
+        )
+        GROUP BY profile_id
+      ) newest ON newest.rowid = o.rowid
     `).all();
     const latestByProfile = new Map(latest.map((row) => [row.profile_id, row]));
 
@@ -395,11 +399,15 @@ export class UsageStore {
       SELECT b.profile_id, b.pool_id, b.binding_confidence, b.last_seen_at
       FROM bindings b
       JOIN (
-        SELECT profile_id, MAX(last_seen_at) AS last_seen_at
-        FROM bindings GROUP BY profile_id
-      ) newest ON newest.profile_id = b.profile_id
-        AND newest.last_seen_at = b.last_seen_at
-      GROUP BY b.profile_id
+        SELECT profile_id, MAX(rowid) AS rowid
+        FROM bindings
+        WHERE (profile_id, last_seen_at) IN (
+          SELECT profile_id, MAX(last_seen_at)
+          FROM bindings
+          GROUP BY profile_id
+        )
+        GROUP BY profile_id
+      ) newest ON newest.rowid = b.rowid
     `).all();
     const bindingByProfile = new Map(bindings.map((row) => [row.profile_id, row]));
 

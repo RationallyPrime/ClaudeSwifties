@@ -279,6 +279,29 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("doctor latest observation breaks received_at ties by insertion order", async () => {
+    const { store } = await freshStore();
+    const receivedAt = "2026-08-15T15:30:01.000Z";
+    expect(store.ingest(observation({
+      sequence: 1,
+      sampled_at: "2026-08-15T15:29:00Z",
+      observed_at: "2026-08-15T15:29:01Z",
+      windows: windows(0.4),
+    }), receivedAt).outcome).toBe("accepted");
+    expect(store.ingest(observation({
+      sequence: 2,
+      sampled_at: "2026-08-15T15:30:00Z",
+      observed_at: "2026-08-15T15:30:01Z",
+      windows: windows(0.5),
+    }), receivedAt).outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:31:00Z");
+    expect(doctor[0]?.last_sequence).toBe(2);
+    expect(doctor[0]?.last_sampled_at).toBe("2026-08-15T15:30:00.000Z");
+    expect(doctor[0]?.last_outcome).toBe("accepted");
+    store.close();
+  });
+
   test("duplicate observation ids are idempotently acknowledged", async () => {
     const { store } = await freshStore();
     const item = observation({ sequence: 1, windows: windows(0.5) });
