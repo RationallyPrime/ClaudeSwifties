@@ -279,6 +279,74 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("an unseen stale instance cannot retire a live collector", async () => {
+    const { store } = await freshStore();
+    const live = VALID_OBSERVATION.observer_instance_id;
+    const unseenStale = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 1,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Delayed spool from an older UUID this database has never seen. Receipt
+    // is now, but the sample predates the live collector. Retiring the live
+    // instance here would make every subsequent live observation `ignored`.
+    const delayed = store.ingest(observation({
+      observer_instance_id: unseenStale,
+      sequence: 80,
+      sampled_at: "2026-08-15T14:00:00Z",
+      observed_at: "2026-08-15T14:00:01Z",
+      windows: windows(0.9),
+    }), "2026-08-15T15:31:00Z");
+    expect(delayed.outcome).toBe("ignored");
+
+    const followUp = store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:30Z",
+      observed_at: "2026-08-15T15:31:31Z",
+      windows: windows(0.52),
+    }), "2026-08-15T15:31:32Z");
+    expect(followUp.outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(live);
+    expect(doctor[0]?.last_sequence).toBe(2);
+    expect(doctor[0]?.last_conflict?.kind).toBe("stale_observer_instance");
+    expect(store.snapshot("2026-08-15T15:32:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.52);
+    store.close();
+  });
+
+  test("an unseen stale instance cannot take over after the live collector goes quiet", async () => {
+    const { store } = await freshStore();
+    const live = VALID_OBSERVATION.observer_instance_id;
+    const unseenStale = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 1,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    const delayed = store.ingest(observation({
+      observer_instance_id: unseenStale,
+      sequence: 80,
+      sampled_at: "2026-08-15T14:00:00Z",
+      observed_at: "2026-08-15T14:00:01Z",
+      windows: windows(0.9),
+    }), "2026-08-16T15:30:02Z");
+    expect(delayed.outcome).toBe("ignored");
+
+    const doctor = store.doctorProfiles("2026-08-16T15:31:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(live);
+    expect(doctor[0]?.last_sequence).toBe(1);
+    expect(doctor[0]?.last_conflict?.kind).toBe("stale_observer_instance");
+    expect(store.snapshot("2026-08-16T15:31:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.5);
+    store.close();
+  });
+
   test("doctor latest observation breaks received_at ties by insertion order", async () => {
     const { store } = await freshStore();
     const receivedAt = "2026-08-15T15:30:01.000Z";

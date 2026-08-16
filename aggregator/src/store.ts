@@ -818,10 +818,12 @@ export class UsageStore {
     ).get(observation.profile_id);
 
     // The sequence high-water mark is scoped to one installation generation:
-    // (observer_instance_id, sequence). A new, never-retired instance is a
-    // legitimate reinstall/relocation whose counter starts over — never
-    // silently ignored against the previous installation's mark. A known
-    // displaced instance is retired below and cannot rotate back.
+    // (observer_instance_id, sequence). A never-retired instance whose
+    // observed_at is newer than the profile's last accepted sample is a
+    // legitimate reinstall/relocation whose counter starts over. An unseen
+    // older instance — typically a delayed spool — must not retire the
+    // current collector. A known displaced instance is retired below and
+    // cannot rotate back.
     const sameInstance =
       sequence?.observer_instance_id === observation.observer_instance_id;
     if (
@@ -874,6 +876,28 @@ export class UsageStore {
     }
 
     if (consumeSequence && sequence && !sameInstance) {
+      // Receipt time cannot order generations: a delayed spool arrives now.
+      // Compare the incoming sample against the last state-changing
+      // observation so an unseen older instance cannot retire a live one.
+      const lastObservedAt = this.latestAcceptedObservedAt(observation.profile_id);
+      const incomingIsNewer = lastObservedAt === null ||
+        Date.parse(observation.observed_at) > Date.parse(lastObservedAt);
+      if (!incomingIsNewer) {
+        this.recordConflict(observation, "stale_observer_instance", null, null, receivedAt, {
+          current_observer_instance_id: sequence.observer_instance_id,
+          current_last_sequence: sequence.last_sequence,
+          current_last_observed_at: lastObservedAt,
+          incoming_observer_instance_id: observation.observer_instance_id,
+          incoming_observed_at: observation.observed_at,
+        });
+        this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
+        return {
+          observation_id: observation.observation_id,
+          outcome: "ignored",
+          clock_skewed: clockSkewed,
+        };
+      }
+
       // Two live installations of one profile competing for its sequence is
       // configuration evidence, not something to resolve silently. Preserve
       // it whenever the displaced instance reported recently.
@@ -1553,6 +1577,15 @@ export class UsageStore {
       receivedAt,
       JSON.stringify(observation),
     );
+  }
+
+  private latestAcceptedObservedAt(profileId: string): string | null {
+    return this.db.query<{ observed_at: string | null }, [string]>(`
+      SELECT MAX(observed_at) AS observed_at
+      FROM observations
+      WHERE profile_id = ?
+        AND outcome IN ('accepted', 'conflict')
+    `).get(profileId)?.observed_at ?? null;
   }
 
   private isRetiredObserverInstance(
