@@ -32,11 +32,14 @@ from .util import (
 DIAGNOSTIC_LIMIT = 64 * 1024
 
 # Statuses that are verdicts about an observation's CONTENT — a malformed
-# payload (400), an oversize one (413), or a namespace rejection (422).
-# Everything else (401/403 credential rotation, 408/429 pressure, 5xx,
-# network) stays on the transient backoff path: retrying those is harmless,
+# payload (400), an edge/profile claim the credential does not cover (403:
+# this aggregator's only forbidden() site tests two fields OF the
+# observation, so it is permanent for that payload, not credential
+# rotation — rotation is 401), an oversize payload (413), or a namespace
+# rejection (422). Everything else (401, 408/429 pressure, 5xx, network)
+# stays on the transient backoff path: retrying those is harmless,
 # retrying these wedges the spool head forever.
-PERMANENT_REJECTION_STATUSES = frozenset({400, 413, 422})
+PERMANENT_REJECTION_STATUSES = frozenset({400, 403, 413, 422})
 
 
 @dataclasses.dataclass

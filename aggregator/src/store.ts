@@ -386,6 +386,11 @@ export class UsageStore {
     const profileIds = new Set<string>([
       ...sequences.map((row) => row.profile_id),
       ...receipts.map((row) => row.profile_id),
+      // A collector mis-provisioned from first boot is rejected BEFORE
+      // ingest, so it has neither a sequence nor a receipt — its only
+      // trace is the conflicts row. Without this, the evidence is written
+      // and then dropped on the read side.
+      ...conflicts.map((row) => row.profile_id),
     ]);
 
     return [...profileIds].sort().map((profileId): DoctorProfile => {

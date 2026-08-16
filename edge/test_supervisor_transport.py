@@ -605,3 +605,37 @@ class PermanentRejectionTests(unittest.TestCase):
             supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
             self.assertEqual(supervisor._drain(RuntimeState(), 1000), 1)
             self.assertEqual(spool.stats()["pending"], 0)
+
+    def test_permanent_403_is_quarantined_like_422(self):
+        """This aggregator's only forbidden() tests two fields OF the
+        observation — a payload verdict, not credential rotation (401)."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[DeliveryFailure("forbidden", status=403)]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            self.assertEqual(spool.stats()["rejected"], 1)
+            self.assertEqual(spool.stats()["pending"], 0)
+
+    def test_rejected_lane_inherits_the_spool_bound(self):
+        """A persistent rejection condition must not turn the bounded spool
+        into unbounded local growth: oldest evidence is pruned first."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), spool_max_count=8)
+            spool = Spool(config)
+            for sequence in range(1, 12):
+                spool.enqueue(observation(config, sequence))
+                spool.quarantine(spool._paths()[0], f"reject {sequence}")
+            self.assertEqual(spool.stats()["rejected"], 8)
+            reasons = sorted(
+                p.read_text() for p in spool.rejected_dir.glob("*.reason.json")
+            )
+            self.assertEqual(len(reasons), 8)
+            joined = " ".join(reasons)
+            for pruned in ('"reject 1"', '"reject 2"', '"reject 3"'):
+                self.assertNotIn(pruned, joined)
+            self.assertIn('"reject 11"', joined)

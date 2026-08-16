@@ -366,6 +366,21 @@ class Spool:
                 {"schema": 1, "reason": reason, "rejected_at": time.time()},
                 mode=0o600,
             )
+            # The lane inherits the spool's own bound: it is evidence, not a
+            # second unbounded queue. Under a persistent rejection condition
+            # the pre-quarantine failure mode was bounded (SpoolFull), so
+            # the cure must not trade a bounded wedge for unbounded growth.
+            # Oldest evidence is dropped first; the newest rejections are
+            # the ones a doctor run will be asked about.
+            kept = sorted(
+                p
+                for p in rejected.iterdir()
+                if p.name.endswith(".json") and not p.name.endswith(".reason.json")
+            )
+            excess = len(kept) - self.config.spool_max_count
+            for stale in kept[: max(0, excess)]:
+                stale.unlink(missing_ok=True)
+                stale.with_name(f"{stale.name}.reason.json").unlink(missing_ok=True)
 
     @property
     def rejected_dir(self) -> Path:
