@@ -474,6 +474,12 @@ test("a collector mis-provisioned from first boot is still named by the doctor",
   const profiles = body.profiles as Array<Record<string, unknown>>;
   const affected = profiles.find((row) => row.profile_id === "desktop-a");
   expect(affected).toBeDefined();
-  expect(affected?.last_conflict).toMatchObject({ kind: "identity_key_mismatch" });
+  expect(affected?.edge_id).toBe("edge-linux");
+  expect(affected?.configured).toBe(true);
+  expect(affected?.last_conflict).toMatchObject({
+    kind: "identity_key_mismatch",
+    presented_key_id: "Zz9y8X7w6V5u4T3s",
+    expected_key_id: VALID_OBSERVATION.identity_key_id,
+  });
   store.close();
 });

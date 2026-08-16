@@ -22,6 +22,23 @@ import {
 const CURRENT_PROFILE_MS = 15 * 60 * 1_000;
 const RECENT_PROFILE_MS = 24 * 60 * 60 * 1_000;
 
+function parseConflictEvidence(raw: string | undefined): Record<string, unknown> {
+  if (raw === undefined) return {};
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 export interface StoreOptions {
   maxPools: number;
   maxFutureSkewMs: number;
@@ -64,7 +81,12 @@ export interface DoctorProfile {
   identity_evidence: string | null;
   identity_key_id: string | null;
   freshness: "current" | "recent" | "stale" | "never";
-  last_conflict: { kind: string; at: string } | null;
+  last_conflict: {
+    kind: string;
+    at: string;
+    presented_key_id?: string;
+    expected_key_id?: string;
+  } | null;
 }
 
 interface PoolRow {
@@ -412,10 +434,10 @@ export class UsageStore {
     const bindingByProfile = new Map(bindings.map((row) => [row.profile_id, row]));
 
     const conflicts = this.db.query<
-      { profile_id: string; kind: string; created_at: string },
+      { profile_id: string; kind: string; created_at: string; evidence_json: string },
       []
     >(`
-      SELECT c.profile_id, c.kind, c.created_at
+      SELECT c.profile_id, c.kind, c.created_at, c.evidence_json
       FROM conflicts c
       JOIN (
         SELECT profile_id, MAX(id) AS id FROM conflicts GROUP BY profile_id
@@ -461,10 +483,14 @@ export class UsageStore {
       const age = lastReceived === null
         ? null
         : Math.max(0, generatedMs - Date.parse(lastReceived));
+      const conflictEvidence = parseConflictEvidence(conflict?.evidence_json);
+      const presentedKeyId = stringField(conflictEvidence, "presented_key_id");
+      const expectedKeyId = stringField(conflictEvidence, "expected_key_id");
+      const evidenceEdgeId = stringField(conflictEvidence, "edge_id");
       return {
         profile_id: profileId,
         observer_instance_id: sequence?.observer_instance_id ?? null,
-        edge_id: sequence?.edge_id ?? null,
+        edge_id: sequence?.edge_id ?? evidenceEdgeId,
         provider,
         first_seen_at: receipt?.first_seen_at ?? null,
         last_received_at: lastReceived,
@@ -474,7 +500,7 @@ export class UsageStore {
         pool_id: binding?.pool_id ?? null,
         binding_confidence: binding?.binding_confidence ?? null,
         identity_evidence: identityEvidence,
-        identity_key_id: identityKeyId,
+        identity_key_id: identityKeyId ?? presentedKeyId,
         freshness: age === null
           ? "never"
           : age <= CURRENT_PROFILE_MS
@@ -484,7 +510,12 @@ export class UsageStore {
               : "stale",
         last_conflict: conflict === null
           ? null
-          : { kind: conflict.kind, at: conflict.created_at },
+          : {
+            kind: conflict.kind,
+            at: conflict.created_at,
+            ...(presentedKeyId === null ? {} : { presented_key_id: presentedKeyId }),
+            ...(expectedKeyId === null ? {} : { expected_key_id: expectedKeyId }),
+          },
       };
     });
   }

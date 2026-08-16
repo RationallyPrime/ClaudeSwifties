@@ -224,10 +224,14 @@ export function createApp(options: AppOptions): UsageApp {
           const observed = options.store.doctorProfiles(currentIso);
           const observedIds = new Set(observed.map((profile) => profile.profile_id));
           const profiles = [
-            ...observed.map((profile) => ({
-              ...profile,
-              configured: configured.has(profile.profile_id),
-            })),
+            ...observed.map((profile) => {
+              const configuredEdge = configured.get(profile.profile_id);
+              return {
+                ...profile,
+                configured: configuredEdge !== undefined,
+                edge_id: profile.edge_id ?? configuredEdge ?? null,
+              };
+            }),
             ...[...configured.entries()]
               .filter(([profileId]) => !observedIds.has(profileId))
               .map(([profileId, edgeId]) => ({
