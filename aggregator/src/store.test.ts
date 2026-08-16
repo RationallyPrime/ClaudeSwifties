@@ -236,6 +236,49 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("a retired observer instance cannot reclaim the profile", async () => {
+    const { store } = await freshStore();
+    const instanceA = VALID_OBSERVATION.observer_instance_id;
+    const instanceB = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 1,
+      provider_subject: SUBJECT_A,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Reinstall a day later: ordinary displacement, no concurrent-instance
+    // noise. An old A spool arriving afterwards must not rotate the active
+    // generation or rewrite the binding back onto A's pool.
+    expect(store.ingest(observation({
+      observer_instance_id: instanceB,
+      sequence: 0,
+      provider_subject: SUBJECT_B,
+      sampled_at: "2026-08-16T15:30:00Z",
+      observed_at: "2026-08-16T15:30:01Z",
+      windows: windows(0.61),
+    }), "2026-08-16T15:30:02Z").outcome).toBe("accepted");
+
+    const reclaim = store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 2,
+      provider_subject: SUBJECT_A,
+      sampled_at: "2026-08-16T15:31:00Z",
+      observed_at: "2026-08-16T15:31:01Z",
+      windows: windows(0.7),
+    }), "2026-08-16T15:31:02Z");
+    expect(reclaim.outcome).toBe("ignored");
+
+    const doctor = store.doctorProfiles("2026-08-16T15:32:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(instanceB);
+    expect(doctor[0]?.last_sequence).toBe(0);
+    expect(doctor[0]?.last_conflict?.kind).toBe("retired_observer_instance");
+    const snapshot = store.snapshot("2026-08-16T15:32:00Z");
+    const bound = snapshot.pools.find((pool) => pool.id === doctor[0]?.pool_id);
+    expect(bound?.windows[0]?.utilization).toBe(0.61);
+    store.close();
+  });
+
   test("duplicate observation ids are idempotently acknowledged", async () => {
     const { store } = await freshStore();
     const item = observation({ sequence: 1, windows: windows(0.5) });

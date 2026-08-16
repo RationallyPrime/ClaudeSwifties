@@ -626,6 +626,14 @@ export class UsageStore {
         evidence_json TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS retired_observer_instances (
+        profile_id TEXT NOT NULL,
+        observer_instance_id TEXT NOT NULL,
+        displaced_by TEXT NOT NULL,
+        retired_at TEXT NOT NULL,
+        PRIMARY KEY (profile_id, observer_instance_id)
+      );
+
       CREATE TABLE IF NOT EXISTS edge_rejections (
         edge_id TEXT PRIMARY KEY,
         count INTEGER NOT NULL,
@@ -770,11 +778,34 @@ export class UsageStore {
     ).get(observation.profile_id);
 
     // The sequence high-water mark is scoped to one installation generation:
-    // (observer_instance_id, sequence). A different instance is a legitimate
-    // reinstall/relocation whose counter starts over — never silently ignored
-    // against the previous installation's mark.
+    // (observer_instance_id, sequence). A new, never-retired instance is a
+    // legitimate reinstall/relocation whose counter starts over — never
+    // silently ignored against the previous installation's mark. A known
+    // displaced instance is retired below and cannot rotate back.
     const sameInstance =
       sequence?.observer_instance_id === observation.observer_instance_id;
+    if (
+      consumeSequence &&
+      this.isRetiredObserverInstance(
+        observation.profile_id,
+        observation.observer_instance_id,
+      )
+    ) {
+      // A known displaced generation cannot become current again. A delayed
+      // or newly queued observation from the retired instance used to rotate
+      // the active row (and its bindings) back onto the stale pool.
+      this.recordConflict(observation, "retired_observer_instance", null, null, receivedAt, {
+        retired_observer_instance_id: observation.observer_instance_id,
+        current_observer_instance_id: sequence?.observer_instance_id ?? null,
+        current_last_sequence: sequence?.last_sequence ?? null,
+      });
+      this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
+      return {
+        observation_id: observation.observation_id,
+        outcome: "ignored",
+        clock_skewed: clockSkewed,
+      };
+    }
     if (
       consumeSequence &&
       sequence &&
@@ -823,6 +854,14 @@ export class UsageStore {
             displaced_last_sequence: sequence.last_sequence,
             incoming_observer_instance_id: observation.observer_instance_id,
           },
+        );
+      }
+      if (sequence.observer_instance_id !== null) {
+        this.retireObserverInstance(
+          observation.profile_id,
+          sequence.observer_instance_id,
+          observation.observer_instance_id,
+          receivedAt,
         );
       }
     }
@@ -1474,6 +1513,30 @@ export class UsageStore {
       receivedAt,
       JSON.stringify(observation),
     );
+  }
+
+  private isRetiredObserverInstance(
+    profileId: string,
+    observerInstanceId: string,
+  ): boolean {
+    return this.db.query<{ present: number }, [string, string]>(`
+      SELECT 1 AS present FROM retired_observer_instances
+      WHERE profile_id = ? AND observer_instance_id = ?
+    `).get(profileId, observerInstanceId) != null;
+  }
+
+  private retireObserverInstance(
+    profileId: string,
+    observerInstanceId: string,
+    displacedBy: string,
+    retiredAt: string,
+  ): void {
+    this.db.query(`
+      INSERT INTO retired_observer_instances (
+        profile_id, observer_instance_id, displaced_by, retired_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(profile_id, observer_instance_id) DO NOTHING
+    `).run(profileId, observerInstanceId, displacedBy, retiredAt);
   }
 
   private recordConflict(
