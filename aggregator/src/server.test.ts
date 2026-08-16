@@ -163,7 +163,12 @@ describe("schema-3 HTTP server", () => {
     const wrongProfile = await app.fetch(post(observation({ profile_id: "other-profile" })), "client-b");
     expect(wrongEdge.status).toBe(403);
     expect(wrongProfile.status).toBe(403);
-    expect(await wrongEdge.text()).toBe('{"error":"forbidden"}');
+    const forbiddenBody = await wrongEdge.json() as Record<string, unknown>;
+    expect(forbiddenBody).toMatchObject({
+      error: "forbidden",
+      code: "forbidden_claim",
+    });
+    expect(typeof forbiddenBody.observation_id).toBe("string");
     expect(store.snapshot("2026-08-15T15:31:00Z").pools).toEqual([]);
 
     // The rejection is evidence, keyed on the CREDENTIAL's edge id (payload
@@ -285,9 +290,13 @@ describe("schema-3 HTTP server", () => {
 
   test("strict unknown-field validation fails closed at the HTTP boundary", async () => {
     const { app, store } = await freshApp();
-    const response = await app.fetch(post({ ...observation(), access_token: "must-not-persist" }));
+    const item = observation();
+    const response = await app.fetch(post({ ...item, access_token: "must-not-persist" }));
     expect(response.status).toBe(400);
-    expect(await response.text()).toContain("unknown field");
+    const body = await response.json() as Record<string, unknown>;
+    expect(String(body.error)).toContain("unknown field");
+    expect(body.code).toBe("invalid_observation");
+    expect(body.observation_id).toBe(item.observation_id);
     expect(store.snapshot("2026-08-15T15:31:00Z").pools).toEqual([]);
     store.close();
   });
@@ -405,11 +414,14 @@ describe("schema-3 HTTP server", () => {
       identity_key_id: "Zz9y8X7w6V5u4T3s",
     })));
     expect(mismatched.status).toBe(422);
-    expect(await mismatched.json()).toEqual({
+    const mismatchBody = await mismatched.json() as Record<string, unknown>;
+    expect(mismatchBody).toMatchObject({
       error: "identity_key_id does not match this aggregator's namespace",
+      code: "identity_key_mismatch",
       presented_key_id: "Zz9y8X7w6V5u4T3s",
       expected_key_id: VALID_OBSERVATION.identity_key_id,
     });
+    expect(typeof mismatchBody.observation_id).toBe("string");
 
     const doctor = await app.fetch(get("/doctor", READ_TOKEN), "doctor-client");
     const body = await doctor.json() as Record<string, unknown>;

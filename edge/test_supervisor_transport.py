@@ -553,7 +553,10 @@ class PermanentRejectionTests(unittest.TestCase):
             transport = RecordingTransport(
                 failures=[
                     DeliveryFailure(
-                        "namespace", status=422, aggregator_error="namespace"
+                        "namespace",
+                        status=422,
+                        aggregator_error="identity_key_mismatch",
+                        aggregator_observation_id=first.observation_id,
                     ),
                     None,
                 ]
@@ -620,11 +623,15 @@ class PermanentRejectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary))
             spool = Spool(config)
-            spool.enqueue(observation(config, 1))
+            queued = observation(config, 1)
+            spool.enqueue(queued)
             transport = RecordingTransport(
                 failures=[
                     DeliveryFailure(
-                        "forbidden", status=403, aggregator_error="forbidden"
+                        "forbidden",
+                        status=403,
+                        aggregator_error="forbidden_claim",
+                        aggregator_observation_id=queued.observation_id,
                     )
                 ]
             )
@@ -632,6 +639,53 @@ class PermanentRejectionTests(unittest.TestCase):
             self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
             self.assertEqual(spool.stats()["rejected"], 1)
             self.assertEqual(spool.stats()["pending"], 0)
+
+    def test_generic_json_error_field_is_not_quarantined(self):
+        """An ingress/WAF 403 with Content-Type application/json and any
+        nonempty ``error`` string is the shape Codex named: it is not an
+        aggregator verdict, so the observation stays on the retry path."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[
+                    DeliveryFailure(
+                        "waf",
+                        status=403,
+                        aggregator_error="Access Denied",
+                    )
+                ]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
+            self.assertTrue(config.retry_path.exists())
+
+    def test_named_verdict_for_a_different_observation_is_not_quarantined(self):
+        """A bindable document that names another observation is not a
+        verdict about the queued item."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[
+                    DeliveryFailure(
+                        "forbidden",
+                        status=403,
+                        aggregator_error="forbidden_claim",
+                        aggregator_observation_id="not-the-queued-observation",
+                    )
+                ]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
 
     def test_intermediary_403_without_a_verdict_document_backs_off(self):
         """The wire status has producers that are not this aggregator: an
@@ -694,7 +748,7 @@ class PermanentRejectionTests(unittest.TestCase):
 
 
 class AggregatorVerdictRecognitionTests(unittest.TestCase):
-    """_aggregator_error_code is the permanence gate: strict by construction."""
+    """The parser extracts a bindable document; the drain decides permanence."""
 
     @staticmethod
     def _http_error(
@@ -711,9 +765,26 @@ class AggregatorVerdictRecognitionTests(unittest.TestCase):
             io.BytesIO(body),
         )
 
-    def test_recognises_the_aggregator_error_document(self):
-        error = self._http_error(403, b'{"error":"forbidden"}', "application/json")
-        self.assertEqual(transport_module._aggregator_error_code(error), "forbidden")
+    def test_recognises_the_bindable_aggregator_error_document(self):
+        error = self._http_error(
+            403,
+            b'{"error":"forbidden","code":"forbidden_claim",'
+            b'"observation_id":"obs-1"}',
+            "application/json",
+        )
+        self.assertEqual(
+            transport_module._aggregator_error_code(error), "forbidden_claim"
+        )
+
+    def test_generic_json_error_field_is_not_a_verdict(self):
+        for body in (
+            b'{"error":"forbidden"}',
+            b'{"error":"Access Denied"}',
+            b'{"error":"forbidden","code":"forbidden_claim"}',
+            b'{"code":"forbidden_claim"}',
+        ):
+            error = self._http_error(403, body, "application/json")
+            self.assertIsNone(transport_module._aggregator_error_code(error), body)
 
     def test_html_bodies_are_not_verdicts(self):
         error = self._http_error(
@@ -727,7 +798,12 @@ class AggregatorVerdictRecognitionTests(unittest.TestCase):
             self.assertIsNone(transport_module._aggregator_error_code(error), body)
 
     def test_missing_content_type_is_not_a_verdict(self):
-        error = self._http_error(403, b'{"error":"forbidden"}', None)
+        error = self._http_error(
+            403,
+            b'{"error":"forbidden","code":"forbidden_claim",'
+            b'"observation_id":"obs-1"}',
+            None,
+        )
         self.assertIsNone(transport_module._aggregator_error_code(error))
 
 

@@ -8,8 +8,14 @@ import {
 
 export const MAX_BODY_BYTES = 8 * 1_024;
 const FIXED_UNAUTHORISED_BODY = JSON.stringify({ error: "unauthorised" });
-const FIXED_FORBIDDEN_BODY = JSON.stringify({ error: "forbidden" });
 const BEARER_PATTERN = /^Bearer ([\x21-\x7e]{16,512})$/;
+
+/** Closed content-verdict codes. The collector only quarantines these. */
+export const PERMANENT_REJECTION_CODES = {
+  invalid_observation: "invalid_observation",
+  forbidden_claim: "forbidden_claim",
+  identity_key_mismatch: "identity_key_mismatch",
+} as const;
 
 export interface ServerStore {
   ingest(observation: UsageObservation, receivedAt: string): IngestResult;
@@ -272,7 +278,21 @@ export function createApp(options: AppOptions): UsageApp {
         const credential = auth.credential;
 
         try {
-          const observation = parseObservation(await readJsonBody(request));
+          const rawBody = await readJsonBody(request);
+          let observation: UsageObservation;
+          try {
+            observation = parseObservation(rawBody);
+          } catch (error) {
+            if (error instanceof ValidationError) {
+              const observationId = peekObservationId(rawBody);
+              return json({
+                error: error.message,
+                code: PERMANENT_REJECTION_CODES.invalid_observation,
+                ...(observationId === null ? {} : { observation_id: observationId }),
+              }, 400);
+            }
+            throw error;
+          }
           if (
             observation.edge_id !== credential.edgeId ||
             !credential.profileIds.has(observation.profile_id)
@@ -292,7 +312,7 @@ export function createApp(options: AppOptions): UsageApp {
               `claimed_edge=${observation.edge_id} ` +
               `claimed_profile=${observation.profile_id}`,
             );
-            return forbidden();
+            return forbidden(observation.observation_id);
           }
           const expectedKeyId = options.expectedIdentityKeyId ?? null;
           if (expectedKeyId !== null && observation.identity_key_id !== expectedKeyId) {
@@ -314,6 +334,8 @@ export function createApp(options: AppOptions): UsageApp {
             );
             return json({
               error: "identity_key_id does not match this aggregator's namespace",
+              code: PERMANENT_REJECTION_CODES.identity_key_mismatch,
+              observation_id: observation.observation_id,
               presented_key_id: observation.identity_key_id,
               expected_key_id: expectedKeyId,
             }, 422);
@@ -332,9 +354,6 @@ export function createApp(options: AppOptions): UsageApp {
         } catch (error) {
           if (error instanceof HttpBoundaryError) {
             return json({ error: error.message }, error.status);
-          }
-          if (error instanceof ValidationError) {
-            return json({ error: error.message }, 400);
           }
           if (error instanceof StoreCapacityError) {
             return json({ error: "pool capacity reached" }, 409);
@@ -453,15 +472,20 @@ function unauthorised(rateLimited = false, windowMs = 0): Response {
   });
 }
 
-function forbidden(): Response {
-  return new Response(FIXED_FORBIDDEN_BODY, {
-    status: 403,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-    },
-  });
+function forbidden(observationId: string): Response {
+  return json({
+    error: "forbidden",
+    code: PERMANENT_REJECTION_CODES.forbidden_claim,
+    observation_id: observationId,
+  }, 403);
+}
+
+function peekObservationId(raw: unknown): string | null {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+  const value = (raw as Record<string, unknown>).observation_id;
+  return typeof value === "string" && value.length > 0 && value.length <= 128
+    ? value
+    : null;
 }
 
 function safeError(error: unknown): string {
