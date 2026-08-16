@@ -14,6 +14,10 @@ services:
       - EDGE_CREDENTIALS_JSON=${USAGE_EDGE_CREDENTIALS_JSON}
       - READ_TOKEN=${USAGE_READ_TOKEN}
       - REQUIRE_LEGACY_IMPORT=${USAGE_REQUIRE_LEGACY_IMPORT:-false}
+      # Fleet identity-key fingerprint (16-char base64url). Empty/unset
+      # disables the namespace guard; set it to the collectors'
+      # identity_key_id once the fleet is re-provisioned.
+      - EXPECTED_IDENTITY_KEY_ID=${EXPECTED_IDENTITY_KEY_ID:-}
     volumes:
       - usage-data:/data
     healthcheck:
