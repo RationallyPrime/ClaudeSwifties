@@ -69,6 +69,7 @@ def claude_statusline(
     config: CollectorConfig,
     *,
     sequence: int | Callable[[], int],
+    observer_instance_id: str | Callable[[], str],
     identity: IdentityHint,
     observed_at: dt.datetime | None = None,
 ) -> ClaudeSensorResult:
@@ -116,8 +117,12 @@ def claude_statusline(
             sampled = min(modified, observed)
             quality = "transcript_mtime"
     resolved_sequence = sequence() if callable(sequence) else sequence
+    resolved_instance = (
+        observer_instance_id() if callable(observer_instance_id) else observer_instance_id
+    )
     observation = make_observation(
         config,
+        observer_instance_id=resolved_instance,
         sequence=resolved_sequence,
         observed_at=observed,
         sampled_at=sampled,

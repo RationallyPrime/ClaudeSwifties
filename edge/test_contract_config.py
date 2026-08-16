@@ -8,7 +8,12 @@ from unittest import mock
 from ai_usage.config import CollectorConfig
 from ai_usage.contract import Observation, QuotaWindow
 from ai_usage.errors import CollectorError, ConfigError
-from ai_usage.identity import claude_identity, codex_identity, grok_identity
+from ai_usage.identity import (
+    claude_identity,
+    codex_identity,
+    grok_identity,
+    identity_key_id,
+)
 from ai_usage.util import Redactor
 from test_support import config_mapping, make_config
 
@@ -17,6 +22,8 @@ class ContractTests(unittest.TestCase):
     def observation(self):
         return Observation(
             observation_id=str(uuid.uuid4()),
+            observer_instance_id=str(uuid.uuid4()),
+            identity_key_id="A1b2C3d4E5f6G7h8",
             sequence=4,
             provider="claude",
             edge_id="edge-test",
@@ -46,6 +53,8 @@ class ContractTests(unittest.TestCase):
             {
                 "schema",
                 "observation_id",
+                "observer_instance_id",
+                "identity_key_id",
                 "sequence",
                 "provider",
                 "edge_id",
@@ -70,6 +79,21 @@ class ContractTests(unittest.TestCase):
     def test_unknown_secret_shaped_field_fails_closed(self):
         value = self.observation().to_dict()
         value["provider_token"] = "must-not-cross-wire"
+        with self.assertRaises(CollectorError):
+            Observation.from_dict(value)
+
+    def test_observer_instance_and_identity_key_id_are_required_and_validated(self):
+        for field in ("observer_instance_id", "identity_key_id"):
+            value = self.observation().to_dict()
+            del value[field]
+            with self.assertRaises(CollectorError):
+                Observation.from_dict(value)
+        value = self.observation().to_dict()
+        value["observer_instance_id"] = "not-a-uuid"
+        with self.assertRaises(CollectorError):
+            Observation.from_dict(value)
+        value = self.observation().to_dict()
+        value["identity_key_id"] = "too/short!"
         with self.assertRaises(CollectorError):
             Observation.from_dict(value)
 
@@ -103,6 +127,15 @@ class ContractTests(unittest.TestCase):
 class IdentityTests(unittest.TestCase):
     def setUp(self):
         self.key = b"x" * 32
+
+    def test_identity_key_id_is_stable_nonsecret_and_key_scoped(self):
+        first = identity_key_id(self.key)
+        self.assertRegex(first, r"^[A-Za-z0-9_-]{16}$")
+        self.assertEqual(first, identity_key_id(self.key))
+        # A different fleet key produces a different namespace identifier —
+        # the whole point is detecting a mis-provisioned collector.
+        self.assertNotEqual(first, identity_key_id(b"y" * 32))
+        self.assertNotIn(self.key.hex(), first)
 
     def test_same_claude_subject_matches_across_profiles_without_exporting_email(self):
         first = claude_identity(

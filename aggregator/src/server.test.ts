@@ -329,8 +329,85 @@ describe("schema-3 HTTP server", () => {
     expect((await app.fetch(get("/doctor"))).status).toBe(401);
     const response = await app.fetch(get("/doctor", READ_TOKEN), "doctor-client");
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ schema: 3, ready: true, conflict_count: 1 });
-    // Doctor exposes only the bounded count, never observation payload details.
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.schema).toBe(3);
+    expect(body.ready).toBe(true);
+    expect(body.conflict_count).toBe(1);
+    expect(body.identity_key_mismatch_count).toBe(0);
+    expect(body.last_identity_key_mismatch).toBeNull();
+
+    // The reporting profile carries its full operational projection.
+    const profiles = body.profiles as Record<string, unknown>[];
+    const reporting = profiles.find((row) => row.profile_id === "desktop-a");
+    expect(reporting).toMatchObject({
+      configured: true,
+      edge_id: "edge-linux",
+      provider: "claude",
+      observer_instance_id: VALID_OBSERVATION.observer_instance_id,
+      identity_key_id: VALID_OBSERVATION.identity_key_id,
+      last_sequence: 2,
+      freshness: "current",
+    });
+    expect(reporting?.first_seen_at).toBeTruthy();
+    const lastConflict = reporting?.last_conflict as Record<string, unknown>;
+    expect(typeof lastConflict.kind).toBe("string");
+    expect(typeof lastConflict.at).toBe("string");
+
+    // Configured-but-silent profiles appear as never-seen, not as absent.
+    const silent = profiles.find((row) => row.profile_id === "other-profile");
+    expect(silent).toMatchObject({
+      configured: true,
+      edge_id: "edge-other",
+      freshness: "never",
+      last_received_at: null,
+    });
+
+    // Doctor exposes bounded evidence, never payloads or provider subjects.
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain(VALID_OBSERVATION.provider_subject);
+    expect(raw).not.toContain("payload");
+    store.close();
+  });
+
+  test("a wrong identity-key namespace is rejected loudly and counted", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "usage-v3-keyid-"));
+    const store = await openStore(dir, DEFAULT_STORE_OPTIONS);
+    const app = createApp({
+      store,
+      readTokenDigest: digestToken(READ_TOKEN),
+      edgeCredentials: [{
+        tokenDigest: digestToken(EDGE_TOKEN),
+        edgeId: "edge-linux",
+        profileIds: new Set(["desktop-a"]),
+      }],
+      invalidAuthMaxAttempts: 20,
+      invalidAuthWindowMs: 60_000,
+      expectedIdentityKeyId: VALID_OBSERVATION.identity_key_id,
+      log: () => {},
+    });
+
+    const accepted = await app.fetch(post(observation({ sequence: 1 })));
+    expect(accepted.status).toBe(200);
+
+    const mismatched = await app.fetch(post(observation({
+      sequence: 2,
+      identity_key_id: "Zz9y8X7w6V5u4T3s",
+    })));
+    expect(mismatched.status).toBe(422);
+    expect(await mismatched.json()).toEqual({
+      error: "identity_key_id does not match this aggregator's namespace",
+      presented_key_id: "Zz9y8X7w6V5u4T3s",
+      expected_key_id: VALID_OBSERVATION.identity_key_id,
+    });
+
+    const doctor = await app.fetch(get("/doctor", READ_TOKEN), "doctor-client");
+    const body = await doctor.json() as Record<string, unknown>;
+    expect(body.identity_key_mismatch_count).toBe(1);
+    expect(body.last_identity_key_mismatch).toMatchObject({
+      profile_id: "desktop-a",
+      edge_id: "edge-linux",
+      presented_key_id: "Zz9y8X7w6V5u4T3s",
+    });
     store.close();
   });
 });

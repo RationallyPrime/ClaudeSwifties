@@ -13,10 +13,10 @@ from typing import Any
 from .config import CollectorConfig
 from .contract import Observation
 from .errors import AuthenticationRequired, CollectorError, ProviderError, SpoolFull
-from .identity import IdentityHint
+from .identity import IdentityHint, identity_key_id
 from .observation import make_observation
 from .providers import collect_provider, poll_claude_identity
-from .spool import FileLock, Sequence, Spool
+from .spool import FileLock, ObserverInstance, Sequence, Spool
 from .transport import DeliveryFailure, ObservationTransport
 from .util import (
     Redactor,
@@ -168,6 +168,7 @@ class Supervisor:
         self.config = config
         self.spool = Spool(config)
         self.sequence = Sequence(config)
+        self.observer_instance = ObserverInstance(config)
         self.transport = transport or ObservationTransport(config)
         self.clock = clock
         self.jitter = jitter
@@ -280,6 +281,7 @@ class Supervisor:
                 pool_label = last.pool_label
         observation = make_observation(
             self.config,
+            observer_instance_id=self.observer_instance.read_or_create(),
             sequence=self.sequence.next(),
             observed_at=observed,
             sampled_at=min(sampled_at, observed),
@@ -352,6 +354,7 @@ class Supervisor:
             )
         observation = make_observation(
             self.config,
+            observer_instance_id=self.observer_instance.read_or_create(),
             sequence=self.sequence.next(),
             observed_at=observed,
             sampled_at=min(sampled, observed),
@@ -519,6 +522,8 @@ def doctor_report(config: CollectorConfig) -> dict[str, Any]:
         "edge_id": config.edge_id,
         "profile_id": config.profile_id,
         "profile_label": config.profile_label,
+        "observer_instance_id": ObserverInstance(config).peek(),
+        "identity_key_id": identity_key_id(config.identity_key),
         "config_mode": config_mode,
         "endpoint_configured": bool(config.endpoint),
         "ingest_token_configured": bool(config.ingest_token),

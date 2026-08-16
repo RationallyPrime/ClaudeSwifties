@@ -13,6 +13,7 @@ from typing import Any
 
 from .config import CollectorConfig
 from .errors import CollectorError
+from .spool import ObserverInstance
 from .util import (
     atomic_write_bytes,
     atomic_write_json,
@@ -351,6 +352,10 @@ def install(provider: str) -> dict[str, Any]:
 
     _install_code(install_root)
     atomic_write_json(config_path, raw_config, mode=0o600)
+    # One immutable installation generation per state dir. A reinstall that
+    # preserved its state keeps the same instance; a fresh state dir mints a
+    # new one, which is what lets the server accept its restarted sequence.
+    observer_instance_id = ObserverInstance(config).read_or_create()
     service_kind, service_file = _service_install(config, install_root)
     manifest: dict[str, Any] = {
         "schema": 1,
@@ -382,6 +387,7 @@ def install(provider: str) -> dict[str, Any]:
     return {
         "provider": provider,
         "profile_id": config.profile_id,
+        "observer_instance_id": observer_instance_id,
         "config": str(config_path),
         "manifest": str(manifest_path),
         "service": str(service_file),

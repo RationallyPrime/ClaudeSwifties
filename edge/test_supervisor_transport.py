@@ -17,11 +17,14 @@ from ai_usage.transport import Acknowledgement, DeliveryFailure, ObservationTran
 from ai_usage.util import UTC
 from test_support import make_config
 
+TEST_OBSERVER_INSTANCE = "018f47f0-167a-7cc4-a3d1-d6f5eb04c0aa"
+
 
 def observation(config, sequence=1, utilization=0.42):
     now = dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
     return make_observation(
         config,
+        observer_instance_id=TEST_OBSERVER_INSTANCE,
         sequence=sequence,
         observed_at=now,
         sampled_at=now,
@@ -278,6 +281,7 @@ class SupervisorTests(unittest.TestCase):
             # Rebuild under the Grok provider config.
             sample = make_observation(
                 config,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 sequence=1,
                 observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
                 sampled_at=dt.datetime(2026, 8, 15, 11, 59, tzinfo=UTC),
@@ -314,6 +318,7 @@ class SupervisorTests(unittest.TestCase):
             config = make_config(Path(temporary), "grok")
             previous = make_observation(
                 config,
+                observer_instance_id=TEST_OBSERVER_INSTANCE,
                 sequence=1,
                 observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
                 sampled_at=dt.datetime(2026, 8, 15, 11, 59, tzinfo=UTC),
@@ -417,6 +422,7 @@ class SupervisorTests(unittest.TestCase):
                 spool.enqueue(
                     make_observation(
                         config,
+                        observer_instance_id=TEST_OBSERVER_INSTANCE,
                         sequence=sequence,
                         observed_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
                         sampled_at=dt.datetime(2026, 8, 15, 12, 0, tzinfo=UTC),

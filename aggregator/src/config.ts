@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 
+import { IDENTITY_KEY_ID_PATTERN } from "./contract.js";
 import { DEFAULT_STORE_OPTIONS, type StoreOptions } from "./store.js";
 
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
@@ -22,6 +23,8 @@ export interface RuntimeConfig {
   requireLegacyImport: boolean;
   invalidAuthMaxAttempts: number;
   invalidAuthWindowMs: number;
+  /** Fleet identity-key namespace guard; null disables the check. */
+  expectedIdentityKeyId: string | null;
 }
 
 export function digestToken(token: string): Buffer {
@@ -88,11 +91,23 @@ export function parseRuntimeConfig(
     throw new Error("READ_TOKEN must differ from every edge ingest token");
   }
 
+  const rawExpectedKeyId = env.EXPECTED_IDENTITY_KEY_ID;
+  let expectedIdentityKeyId: string | null = null;
+  if (rawExpectedKeyId !== undefined && rawExpectedKeyId !== "") {
+    if (!IDENTITY_KEY_ID_PATTERN.test(rawExpectedKeyId)) {
+      throw new Error(
+        "EXPECTED_IDENTITY_KEY_ID must be a 16 character base64url identifier",
+      );
+    }
+    expectedIdentityKeyId = rawExpectedKeyId;
+  }
+
   return {
     port,
     dataDir,
     readTokenDigest,
     edgeCredentials,
+    expectedIdentityKeyId,
     store: {
       maxPools,
       maxFutureSkewMs: futureSkewSeconds * 1_000,

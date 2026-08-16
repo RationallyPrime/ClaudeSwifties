@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,57 @@ class Sequence:
             # path budget by an order of magnitude on APFS.
             atomic_write_bytes(
                 self.path, f"{value}\n".encode("ascii"), mode=0o600, sync=False
+            )
+            return value
+
+
+class ObserverInstance:
+    """Immutable installation-generation identity for one collector state dir.
+
+    The server keys its per-profile sequence high-water mark on
+    ``(observer_instance_id, sequence)``. A reinstalled or relocated collector
+    whose state dir was not preserved starts a new instance and therefore a
+    new legitimate sequence, instead of being silently ignored against the
+    previous installation's counter.
+    """
+
+    def __init__(self, config: CollectorConfig):
+        self.path = config.observer_instance_path
+        self.lock_path = config.state_dir / "sequence.lock"
+
+    def peek(self) -> str | None:
+        """Read without creating — for the read-only doctor path."""
+        try:
+            raw = self.path.read_text(encoding="ascii").strip()
+            return str(uuid.UUID(raw)) if raw else None
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+
+    def read_or_create(self) -> str:
+        try:
+            raw = self.path.read_text(encoding="ascii").strip()
+            if raw:
+                return str(uuid.UUID(raw))
+            raise CollectorError("observer instance state is empty")
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            raise CollectorError("observer instance state is corrupt") from error
+        with FileLock(self.lock_path):
+            # Re-read under the lock: a concurrent process may have won.
+            try:
+                raw = self.path.read_text(encoding="ascii").strip()
+                if raw:
+                    return str(uuid.UUID(raw))
+            except FileNotFoundError:
+                pass
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                raise CollectorError("observer instance state is corrupt") from error
+            value = str(uuid.uuid4())
+            atomic_write_bytes(
+                self.path, f"{value}\n".encode("ascii"), mode=0o600, sync=True
             )
             return value
 

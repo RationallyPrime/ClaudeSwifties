@@ -12,6 +12,21 @@ from typing import Any
 from .util import normalize_identity
 
 
+IDENTITY_KEY_NAMESPACE = b"ai-usage-identity-namespace/v1"
+
+
+def identity_key_id(key: bytes) -> str:
+    """Non-secret identifier of the identity-key namespace.
+
+    Every observer must HMAC provider identities with the same fleet-wide
+    key, or one account splits into several apparently verified pools. This
+    identifier lets the aggregator detect a mis-provisioned key without the
+    key itself ever crossing the wire.
+    """
+    raw = hmac.new(key, IDENTITY_KEY_NAMESPACE, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")[:16]
+
+
 @dataclass(frozen=True)
 class IdentityHint:
     digest: str | None

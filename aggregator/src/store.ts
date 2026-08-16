@@ -49,6 +49,24 @@ export interface IngestResult {
   clock_skewed: boolean;
 }
 
+export interface DoctorProfile {
+  profile_id: string;
+  observer_instance_id: string | null;
+  edge_id: string | null;
+  provider: string | null;
+  first_seen_at: string | null;
+  last_received_at: string | null;
+  last_sampled_at: string | null;
+  last_sequence: number | null;
+  last_outcome: string | null;
+  pool_id: string | null;
+  binding_confidence: string | null;
+  identity_evidence: string | null;
+  identity_key_id: string | null;
+  freshness: "current" | "recent" | "stale" | "never";
+  last_conflict: { kind: string; at: string } | null;
+}
+
 interface PoolRow {
   id: string;
   provider: UsageProvider;
@@ -196,6 +214,208 @@ export class UsageStore {
     return row?.count ?? 0;
   }
 
+  /** A rejected wrong-namespace observation is loud, durable evidence. */
+  recordIdentityKeyMismatch(
+    profileId: string,
+    edgeId: string,
+    presentedKeyId: string,
+    at: string,
+  ): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = Number(
+        this.db.query<{ value: string }, [string]>(
+          "SELECT value FROM metadata WHERE key = ?",
+        ).get("identity_key_mismatch_count")?.value ?? "0",
+      );
+      this.db.query("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)")
+        .run("identity_key_mismatch_count", String(current + 1));
+      this.db.query("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)")
+        .run(
+          "last_identity_key_mismatch",
+          JSON.stringify({
+            profile_id: profileId,
+            edge_id: edgeId,
+            presented_key_id: presentedKeyId,
+            at,
+          }),
+        );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  identityKeyMismatchCount(): number {
+    return Number(
+      this.db.query<{ value: string }, [string]>(
+        "SELECT value FROM metadata WHERE key = ?",
+      ).get("identity_key_mismatch_count")?.value ?? "0",
+    );
+  }
+
+  lastIdentityKeyMismatch(): Record<string, unknown> | null {
+    const raw = this.db.query<{ value: string }, [string]>(
+      "SELECT value FROM metadata WHERE key = ?",
+    ).get("last_identity_key_mismatch")?.value;
+    if (raw === undefined) return null;
+    try {
+      return JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Per-profile operational projection for the authenticated doctor. No
+   * credentials, no raw payloads, no provider subjects — only the evidence an
+   * operator needs to answer "which collector stopped, and why".
+   */
+  doctorProfiles(generatedAt: string): DoctorProfile[] {
+    const generatedMs = Date.parse(new Date(generatedAt).toISOString());
+    const sequences = this.db.query<
+      {
+        profile_id: string;
+        edge_id: string;
+        last_sequence: number;
+        observer_instance_id: string | null;
+        updated_at: string | null;
+      },
+      []
+    >(`
+      SELECT profile_id, edge_id, last_sequence, observer_instance_id, updated_at
+      FROM profile_sequences
+    `).all();
+
+    const receipts = this.db.query<
+      {
+        profile_id: string;
+        first_seen_at: string;
+        last_received_at: string;
+      },
+      []
+    >(`
+      SELECT profile_id,
+             MIN(received_at) AS first_seen_at,
+             MAX(received_at) AS last_received_at
+      FROM observations
+      GROUP BY profile_id
+    `).all();
+    const receiptByProfile = new Map(receipts.map((row) => [row.profile_id, row]));
+
+    const latest = this.db.query<
+      {
+        profile_id: string;
+        sampled_at: string;
+        outcome: string;
+        payload_json: string;
+      },
+      []
+    >(`
+      SELECT o.profile_id, o.sampled_at, o.outcome, o.payload_json
+      FROM observations o
+      JOIN (
+        SELECT profile_id, MAX(received_at) AS received_at
+        FROM observations GROUP BY profile_id
+      ) newest ON newest.profile_id = o.profile_id
+        AND newest.received_at = o.received_at
+      GROUP BY o.profile_id
+    `).all();
+    const latestByProfile = new Map(latest.map((row) => [row.profile_id, row]));
+
+    const bindings = this.db.query<
+      {
+        profile_id: string;
+        pool_id: string;
+        binding_confidence: string;
+        last_seen_at: string;
+      },
+      []
+    >(`
+      SELECT b.profile_id, b.pool_id, b.binding_confidence, b.last_seen_at
+      FROM bindings b
+      JOIN (
+        SELECT profile_id, MAX(last_seen_at) AS last_seen_at
+        FROM bindings GROUP BY profile_id
+      ) newest ON newest.profile_id = b.profile_id
+        AND newest.last_seen_at = b.last_seen_at
+      GROUP BY b.profile_id
+    `).all();
+    const bindingByProfile = new Map(bindings.map((row) => [row.profile_id, row]));
+
+    const conflicts = this.db.query<
+      { profile_id: string; kind: string; created_at: string },
+      []
+    >(`
+      SELECT c.profile_id, c.kind, c.created_at
+      FROM conflicts c
+      JOIN (
+        SELECT profile_id, MAX(id) AS id FROM conflicts GROUP BY profile_id
+      ) newest ON newest.id = c.id
+    `).all();
+    const conflictByProfile = new Map(conflicts.map((row) => [row.profile_id, row]));
+
+    const profileIds = new Set<string>([
+      ...sequences.map((row) => row.profile_id),
+      ...receipts.map((row) => row.profile_id),
+    ]);
+
+    return [...profileIds].sort().map((profileId): DoctorProfile => {
+      const sequence = sequences.find((row) => row.profile_id === profileId) ?? null;
+      const receipt = receiptByProfile.get(profileId) ?? null;
+      const newest = latestByProfile.get(profileId) ?? null;
+      const binding = bindingByProfile.get(profileId) ?? null;
+      const conflict = conflictByProfile.get(profileId) ?? null;
+      let provider: string | null = null;
+      let identityEvidence: string | null = null;
+      let identityKeyId: string | null = null;
+      if (newest) {
+        try {
+          const payload = JSON.parse(newest.payload_json) as Record<string, unknown>;
+          provider = typeof payload.provider === "string" ? payload.provider : null;
+          identityEvidence = typeof payload.identity_evidence === "string"
+            ? payload.identity_evidence
+            : null;
+          identityKeyId = typeof payload.identity_key_id === "string"
+            ? payload.identity_key_id
+            : null;
+        } catch {
+          // A corrupt stored payload degrades this row, never the doctor.
+        }
+      }
+      const lastReceived = receipt?.last_received_at ?? null;
+      const age = lastReceived === null
+        ? null
+        : Math.max(0, generatedMs - Date.parse(lastReceived));
+      return {
+        profile_id: profileId,
+        observer_instance_id: sequence?.observer_instance_id ?? null,
+        edge_id: sequence?.edge_id ?? null,
+        provider,
+        first_seen_at: receipt?.first_seen_at ?? null,
+        last_received_at: lastReceived,
+        last_sampled_at: newest?.sampled_at ?? null,
+        last_sequence: sequence?.last_sequence ?? null,
+        last_outcome: newest?.outcome ?? null,
+        pool_id: binding?.pool_id ?? null,
+        binding_confidence: binding?.binding_confidence ?? null,
+        identity_evidence: identityEvidence,
+        identity_key_id: identityKeyId,
+        freshness: age === null
+          ? "never"
+          : age <= CURRENT_PROFILE_MS
+            ? "current"
+            : age <= RECENT_PROFILE_MS
+              ? "recent"
+              : "stale",
+        last_conflict: conflict === null
+          ? null
+          : { kind: conflict.kind, at: conflict.created_at },
+      };
+    });
+  }
+
   latestSessionObservationId(profileId: string, sessionId: string | null): string | null {
     return this.db.query<{ observation_id: string }, [string, string]>(`
       SELECT observation_id FROM latest_session_observations
@@ -239,6 +459,18 @@ export class UsageStore {
     if (poolSchema && !poolSchema.includes("billing_unavailable")) {
       this.migrateStatusConstraint();
     }
+    const sequenceSchema = this.db.query<{ sql: string }, [string]>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get("profile_sequences")?.sql;
+    if (sequenceSchema && !sequenceSchema.includes("observer_instance_id")) {
+      // Pre-instance rows keep a NULL instance: the next observation from any
+      // instance replaces them without a concurrency conflict, which is the
+      // correct rollout posture for the coordinated cutover.
+      this.db.exec(`
+        ALTER TABLE profile_sequences ADD COLUMN observer_instance_id TEXT;
+        ALTER TABLE profile_sequences ADD COLUMN updated_at TEXT;
+      `);
+    }
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS metadata (
@@ -268,7 +500,9 @@ export class UsageStore {
       CREATE TABLE IF NOT EXISTS profile_sequences (
         profile_id TEXT PRIMARY KEY,
         edge_id TEXT NOT NULL,
-        last_sequence INTEGER NOT NULL
+        last_sequence INTEGER NOT NULL,
+        observer_instance_id TEXT,
+        updated_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS bindings (
@@ -451,11 +685,31 @@ export class UsageStore {
 
     const { observation, clockSkewed } = this.clampTimestamps(original, receivedAt);
     const sessionKey = observation.session_id ?? "__profile__";
-    const sequence = this.db.query<{ edge_id: string; last_sequence: number }, [string]>(
-      "SELECT edge_id, last_sequence FROM profile_sequences WHERE profile_id = ?",
+    const sequence = this.db.query<
+      {
+        edge_id: string;
+        last_sequence: number;
+        observer_instance_id: string | null;
+        updated_at: string | null;
+      },
+      [string]
+    >(
+      `SELECT edge_id, last_sequence, observer_instance_id, updated_at
+       FROM profile_sequences WHERE profile_id = ?`,
     ).get(observation.profile_id);
 
-    if (consumeSequence && sequence && observation.sequence <= sequence.last_sequence) {
+    // The sequence high-water mark is scoped to one installation generation:
+    // (observer_instance_id, sequence). A different instance is a legitimate
+    // reinstall/relocation whose counter starts over — never silently ignored
+    // against the previous installation's mark.
+    const sameInstance =
+      sequence?.observer_instance_id === observation.observer_instance_id;
+    if (
+      consumeSequence &&
+      sequence &&
+      sameInstance &&
+      observation.sequence <= sequence.last_sequence
+    ) {
       this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
       return {
         observation_id: observation.observation_id,
@@ -464,14 +718,48 @@ export class UsageStore {
       };
     }
 
+    if (consumeSequence && sequence && !sameInstance) {
+      // Two live installations of one profile competing for its sequence is
+      // configuration evidence, not something to resolve silently. Preserve
+      // it whenever the displaced instance reported recently.
+      const displacedRecently =
+        sequence.observer_instance_id !== null &&
+        sequence.updated_at !== null &&
+        Date.parse(receivedAt) - Date.parse(sequence.updated_at) <= CURRENT_PROFILE_MS;
+      if (displacedRecently) {
+        this.recordConflict(
+          observation,
+          "concurrent_observer_instances",
+          null,
+          null,
+          receivedAt,
+          {
+            displaced_observer_instance_id: sequence.observer_instance_id,
+            displaced_updated_at: sequence.updated_at,
+            displaced_last_sequence: sequence.last_sequence,
+            incoming_observer_instance_id: observation.observer_instance_id,
+          },
+        );
+      }
+    }
+
     if (consumeSequence) {
       this.db.query(`
-        INSERT INTO profile_sequences (profile_id, edge_id, last_sequence)
-        VALUES (?, ?, ?)
+        INSERT INTO profile_sequences (
+          profile_id, edge_id, last_sequence, observer_instance_id, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(profile_id) DO UPDATE SET
           edge_id = excluded.edge_id,
-          last_sequence = excluded.last_sequence
-      `).run(observation.profile_id, observation.edge_id, observation.sequence);
+          last_sequence = excluded.last_sequence,
+          observer_instance_id = excluded.observer_instance_id,
+          updated_at = excluded.updated_at
+      `).run(
+        observation.profile_id,
+        observation.edge_id,
+        observation.sequence,
+        observation.observer_instance_id,
+        receivedAt,
+      );
     }
 
     const existingBinding = this.db.query<BindingRow, [string, string]>(`
@@ -1253,6 +1541,11 @@ function legacyObservation(
   const parsed = parseObservation({
     schema: 3,
     observation_id: randomUUID(),
+    // Legacy state predates installation generations and key namespacing;
+    // synthesize both (the import never consumes sequences, so the instance
+    // only labels provenance).
+    observer_instance_id: randomUUID(),
+    identity_key_id: "legacy-import-00",
     sequence: index,
     provider,
     edge_id: "legacy-import",

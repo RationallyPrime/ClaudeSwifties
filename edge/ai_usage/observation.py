@@ -8,7 +8,7 @@ import uuid
 
 from .config import CollectorConfig
 from .contract import COLLECTOR_VERSION, Observation, QuotaWindow
-from .identity import IdentityHint
+from .identity import IdentityHint, identity_key_id
 from .util import display_text, isoformat
 
 
@@ -19,6 +19,7 @@ def source_host() -> str:
 def make_observation(
     config: CollectorConfig,
     *,
+    observer_instance_id: str,
     sequence: int,
     observed_at: dt.datetime,
     sampled_at: dt.datetime,
@@ -33,6 +34,8 @@ def make_observation(
     sampled_at = min(sampled_at, observed_at)
     return Observation(
         observation_id=str(uuid.uuid4()),
+        observer_instance_id=observer_instance_id,
+        identity_key_id=identity_key_id(config.identity_key),
         sequence=sequence,
         provider=config.provider,
         edge_id=config.edge_id,
