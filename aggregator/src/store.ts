@@ -423,6 +423,7 @@ export class UsageStore {
     `).all();
     const conflictByProfile = new Map(conflicts.map((row) => [row.profile_id, row]));
 
+    const sequenceByProfile = new Map(sequences.map((row) => [row.profile_id, row]));
     const profileIds = new Set<string>([
       ...sequences.map((row) => row.profile_id),
       ...receipts.map((row) => row.profile_id),
@@ -434,7 +435,7 @@ export class UsageStore {
     ]);
 
     return [...profileIds].sort().map((profileId): DoctorProfile => {
-      const sequence = sequences.find((row) => row.profile_id === profileId) ?? null;
+      const sequence = sequenceByProfile.get(profileId) ?? null;
       const receipt = receiptByProfile.get(profileId) ?? null;
       const newest = latestByProfile.get(profileId) ?? null;
       const binding = bindingByProfile.get(profileId) ?? null;
