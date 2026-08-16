@@ -366,19 +366,39 @@ class Spool:
                 {"schema": 1, "reason": reason, "rejected_at": time.time()},
                 mode=0o600,
             )
-            # The lane inherits the spool's own bound: it is evidence, not a
-            # second unbounded queue. Under a persistent rejection condition
-            # the pre-quarantine failure mode was bounded (SpoolFull), so
-            # the cure must not trade a bounded wedge for unbounded growth.
-            # Oldest evidence is dropped first; the newest rejections are
-            # the ones a doctor run will be asked about.
+            # The lane inherits BOTH of the spool's bounds: it is evidence,
+            # not a second unbounded queue. Under a persistent rejection
+            # condition the pre-quarantine failure mode was bounded
+            # (SpoolFull) by count AND bytes, so the cure must not trade a
+            # bounded wedge for growth bounded only by the count the
+            # operator may not have used to bound anything. Oldest evidence
+            # is dropped first; the newest rejections are the ones a doctor
+            # run will be asked about.
             kept = sorted(
                 p
                 for p in rejected.iterdir()
                 if p.name.endswith(".json") and not p.name.endswith(".reason.json")
             )
-            excess = len(kept) - self.config.spool_max_count
-            for stale in kept[: max(0, excess)]:
+
+            def lane_bytes(paths: list[Path]) -> int:
+                total = 0
+                for entry in paths:
+                    for candidate in (
+                        entry,
+                        entry.with_name(f"{entry.name}.reason.json"),
+                    ):
+                        try:
+                            total += candidate.stat().st_size
+                        except FileNotFoundError:
+                            continue
+                return total
+
+            excess = max(0, len(kept) - self.config.spool_max_count)
+            while excess < len(kept) and (
+                lane_bytes(kept[excess:]) > self.config.spool_max_bytes
+            ):
+                excess += 1
+            for stale in kept[:excess]:
                 stale.unlink(missing_ok=True)
                 stale.with_name(f"{stale.name}.reason.json").unlink(missing_ok=True)
 

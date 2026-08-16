@@ -295,6 +295,38 @@ export class UsageStore {
   }
 
   /**
+   * A verified claim rejection (403) for an authenticated edge. Keyed on the
+   * CREDENTIAL's edge id — never on payload fields, which are
+   * attacker-controlled within an authenticated edge and would make this an
+   * unbounded write. Bounded by the configured credential set.
+   */
+  recordEdgeForbidden(edgeId: string, observationId: string, at: string): void {
+    this.db.query(`
+      INSERT INTO edge_rejections (edge_id, count, last_at, last_observation_id)
+      VALUES (?, 1, ?, ?)
+      ON CONFLICT(edge_id) DO UPDATE SET
+        count = count + 1, last_at = excluded.last_at,
+        last_observation_id = excluded.last_observation_id
+    `).run(edgeId, at, observationId);
+  }
+
+  /** Per-edge claim-rejection evidence for the authenticated doctor. */
+  doctorEdges(): Array<Record<string, unknown>> {
+    return this.db.query<
+      { edge_id: string; count: number; last_at: string; last_observation_id: string },
+      []
+    >(`
+      SELECT edge_id, count, last_at, last_observation_id
+      FROM edge_rejections ORDER BY edge_id
+    `).all().map((row) => ({
+      edge_id: row.edge_id,
+      forbidden_count: row.count,
+      last_forbidden_at: row.last_at,
+      last_forbidden_observation_id: row.last_observation_id,
+    }));
+  }
+
+  /**
    * Per-profile operational projection for the authenticated doctor. No
    * credentials, no raw payloads, no provider subjects — only the evidence an
    * operator needs to answer "which collector stopped, and why".
@@ -592,6 +624,13 @@ export class UsageStore {
         matched_pool_id TEXT,
         created_at TEXT NOT NULL,
         evidence_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS edge_rejections (
+        edge_id TEXT PRIMARY KEY,
+        count INTEGER NOT NULL,
+        last_at TEXT NOT NULL,
+        last_observation_id TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS readiness_probe (

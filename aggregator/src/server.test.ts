@@ -165,6 +165,17 @@ describe("schema-3 HTTP server", () => {
     expect(wrongProfile.status).toBe(403);
     expect(await wrongEdge.text()).toBe('{"error":"forbidden"}');
     expect(store.snapshot("2026-08-15T15:31:00Z").pools).toEqual([]);
+
+    // The rejection is evidence, keyed on the CREDENTIAL's edge id (payload
+    // fields are attacker-controlled within an authenticated edge): the
+    // doctor names which edge is being refused and how often.
+    const doctor = await app.fetch(get("/doctor", READ_TOKEN), "reader");
+    expect(doctor.status).toBe(200);
+    const report = await doctor.json() as Record<string, unknown>;
+    const edges = report.edges as Array<Record<string, unknown>>;
+    expect(edges.map((edge) => edge.edge_id).sort()).toEqual(["edge-linux"]);
+    expect(edges[0]?.forbidden_count).toBe(2);
+    expect(typeof edges[0]?.last_forbidden_at).toBe("string");
     store.close();
   });
 

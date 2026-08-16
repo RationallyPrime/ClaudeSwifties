@@ -1,11 +1,14 @@
 import datetime as dt
+import io
 import json
 import tempfile
 import unittest
 import urllib.error
+from email.message import Message
 from pathlib import Path
 from unittest import mock
 
+from ai_usage import transport as transport_module
 from ai_usage.contract import QuotaWindow
 from ai_usage.errors import CollectorError
 from ai_usage.identity import IdentityHint
@@ -548,7 +551,12 @@ class PermanentRejectionTests(unittest.TestCase):
             spool.enqueue(first)
             spool.enqueue(second)
             transport = RecordingTransport(
-                failures=[DeliveryFailure("namespace", status=422), None]
+                failures=[
+                    DeliveryFailure(
+                        "namespace", status=422, aggregator_error="namespace"
+                    ),
+                    None,
+                ]
             )
             supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
             state = RuntimeState()
@@ -614,12 +622,56 @@ class PermanentRejectionTests(unittest.TestCase):
             spool = Spool(config)
             spool.enqueue(observation(config, 1))
             transport = RecordingTransport(
-                failures=[DeliveryFailure("forbidden", status=403)]
+                failures=[
+                    DeliveryFailure(
+                        "forbidden", status=403, aggregator_error="forbidden"
+                    )
+                ]
             )
             supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
             self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
             self.assertEqual(spool.stats()["rejected"], 1)
             self.assertEqual(spool.stats()["pending"], 0)
+
+    def test_intermediary_403_without_a_verdict_document_backs_off(self):
+        """The wire status has producers that are not this aggregator: an
+        ingress/tunnel/WAF 403 (HTML or empty body) must stay on the
+        transient backoff path — quarantining it destroys observations
+        that deliver fine once the ingress is fixed."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[DeliveryFailure("tunnel", status=403)]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
+            self.assertTrue(config.retry_path.exists())
+
+    def test_wire_413_is_always_transient(self):
+        """The edge refuses oversize payloads at encode, so an aggregator
+        413 is unreachable for a queued observation — a wire 413 is an
+        ingress body limit, and never a payload verdict."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary))
+            spool = Spool(config)
+            spool.enqueue(observation(config, 1))
+            transport = RecordingTransport(
+                failures=[
+                    DeliveryFailure(
+                        "too large", status=413, aggregator_error="body too large"
+                    )
+                ]
+            )
+            supervisor = Supervisor(config, transport=transport, clock=lambda: 1000)
+            self.assertEqual(supervisor._drain(RuntimeState(), 1000), 0)
+            stats = spool.stats()
+            self.assertEqual(stats["pending"], 1)
+            self.assertEqual(stats["rejected"], 0)
 
     def test_rejected_lane_inherits_the_spool_bound(self):
         """A persistent rejection condition must not turn the bounded spool
@@ -639,3 +691,66 @@ class PermanentRejectionTests(unittest.TestCase):
             for pruned in ('"reject 1"', '"reject 2"', '"reject 3"'):
                 self.assertNotIn(pruned, joined)
             self.assertIn('"reject 11"', joined)
+
+
+class AggregatorVerdictRecognitionTests(unittest.TestCase):
+    """_aggregator_error_code is the permanence gate: strict by construction."""
+
+    @staticmethod
+    def _http_error(
+        code: int, body: bytes, content_type: str | None
+    ) -> urllib.error.HTTPError:
+        headers = Message()
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        return urllib.error.HTTPError(
+            "https://aggregator.example/v3/observations",
+            code,
+            "err",
+            headers,
+            io.BytesIO(body),
+        )
+
+    def test_recognises_the_aggregator_error_document(self):
+        error = self._http_error(403, b'{"error":"forbidden"}', "application/json")
+        self.assertEqual(transport_module._aggregator_error_code(error), "forbidden")
+
+    def test_html_bodies_are_not_verdicts(self):
+        error = self._http_error(
+            403, b"<html>Access denied</html>", "text/html; charset=utf-8"
+        )
+        self.assertIsNone(transport_module._aggregator_error_code(error))
+
+    def test_json_content_type_with_unrecognised_shape_is_not_a_verdict(self):
+        for body in (b"[]", b'{"detail":"nope"}', b'{"error":""}', b"not json"):
+            error = self._http_error(403, body, "application/json")
+            self.assertIsNone(transport_module._aggregator_error_code(error), body)
+
+    def test_missing_content_type_is_not_a_verdict(self):
+        error = self._http_error(403, b'{"error":"forbidden"}', None)
+        self.assertIsNone(transport_module._aggregator_error_code(error))
+
+
+class RejectedLaneByteBoundTests(unittest.TestCase):
+    def test_rejected_lane_honours_the_byte_bound_too(self):
+        """The pending spool is bounded by count AND bytes; the evidence lane
+        must inherit the pair, not just the count — a tight byte bound with
+        a loose count bound must still bound the lane's disk use."""
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(
+                Path(temporary), spool_max_count=400, spool_max_bytes=65536
+            )
+            spool = Spool(config)
+            for sequence in range(1, 121):
+                spool.enqueue(observation(config, sequence))
+                spool.quarantine(spool._paths()[0], f"reject {sequence}")
+            lane_bytes = 0
+            for path in spool.rejected_dir.iterdir():
+                lane_bytes += path.stat().st_size
+            self.assertLessEqual(lane_bytes, config.spool_max_bytes)
+            self.assertGreater(spool.stats()["rejected"], 0)
+            # The newest evidence survives the prune.
+            reasons = " ".join(
+                p.read_text() for p in spool.rejected_dir.glob("*.reason.json")
+            )
+            self.assertIn('"reject 120"', reasons)

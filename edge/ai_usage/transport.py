@@ -38,10 +38,50 @@ class DeliveryFailure(TransportError):
         *,
         status: int | None = None,
         retry_after: float | None = None,
+        aggregator_error: str | None = None,
     ):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
+        # The ``error`` token from an aggregator-shaped JSON error document,
+        # or None when the response could have come from any other hop
+        # (ingress, tunnel, WAF). Permanence classification requires it: a
+        # bare status integer is not an aggregator verdict.
+        self.aggregator_error = aggregator_error
+
+
+def _aggregator_error_code(error: urllib.error.HTTPError) -> str | None:
+    """The ``error`` token from an aggregator-shaped JSON error document.
+
+    A permanent rejection must be the aggregator's own verdict about the
+    payload. Intermediaries (HTTPS ingress, tunnel, WAF) produce the same
+    status integers with HTML or empty bodies; treating those as payload
+    verdicts destroys queued observations that would deliver fine once the
+    ingress is fixed. Recognition is strict: JSON content type, bounded
+    body, a JSON object carrying a non-empty string ``error`` field —
+    anything else returns None and stays on the transient backoff path.
+    """
+    content_type = ""
+    if error.headers is not None:
+        content_type = str(error.headers.get("Content-Type") or "")
+    if content_type.split(";")[0].strip().lower() != "application/json":
+        return None
+    try:
+        body = error.read(MAX_RESPONSE_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if body is None or len(body) > MAX_RESPONSE_BYTES:
+        return None
+    try:
+        document = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    code = document.get("error")
+    if isinstance(code, str) and code:
+        return code
+    return None
 
 
 def _retry_after(headers: Message | None) -> float | None:
@@ -92,6 +132,7 @@ class ObservationTransport:
                 f"aggregator returned HTTP {error.code}",
                 status=error.code,
                 retry_after=_retry_after(error.headers),
+                aggregator_error=_aggregator_error_code(error),
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise DeliveryFailure(
