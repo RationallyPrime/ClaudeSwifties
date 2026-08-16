@@ -276,6 +276,37 @@ class SupervisorTests(unittest.TestCase):
                 )
             )
 
+    def test_claude_profile_samples_through_the_polling_lane(self):
+        """PIN: _collect no longer skips claude.
+
+        The v3 collector originally special-cased claude out of the polling
+        loop ("samples arrive through the status-line sensor"), so wake-driven
+        headless seats never produced a pool sample and their pools sat
+        permanently stale. Claude now flows the same collect path as codex and
+        grok.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            config = make_config(Path(temporary), "claude")
+            reading = ProviderReading(
+                IdentityHint("C" * 43, "org_email"),
+                [QuotaWindow("five-hour", "5h", 300, 0.08, "2026-08-17T00:49:59Z")],
+                "ok",
+                config.pool_label,
+            )
+            supervisor = Supervisor(
+                config, transport=RecordingTransport(), clock=lambda: 1000
+            )
+            state = RuntimeState(sample_checked_at=0)
+            with mock.patch(
+                "ai_usage.supervisor.collect_provider", return_value=reading
+            ) as collect:
+                observed = supervisor._collect(state, 1000)
+            collect.assert_called_once()
+            self.assertIsNotNone(observed)
+            self.assertEqual(observed.provider, "claude")
+            self.assertEqual(observed.windows, tuple(reading.windows))
+            self.assertEqual(observed.status, "ok")
+
     def test_grok_billing_unavailable_preserves_last_good_windows(self):
         with tempfile.TemporaryDirectory() as temporary:
             config = make_config(Path(temporary), "grok")

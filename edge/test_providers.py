@@ -1,11 +1,23 @@
+import json
 import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 
 from ai_usage.errors import AuthenticationRequired, ProviderError
-from ai_usage.providers import grok_reading, poll_claude_identity, read_codex, read_grok
+from ai_usage.providers import (
+    CLAUDE_USAGE_BETA_HEADER,
+    CLAUDE_USAGE_ENDPOINT,
+    claude_usage_windows,
+    grok_reading,
+    load_claude_access_token,
+    poll_claude_identity,
+    read_claude,
+    read_codex,
+    read_grok,
+)
 from test_support import make_config, write_executable
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -258,6 +270,163 @@ for line in sys.stdin:
             )
             with self.assertRaisesRegex(ProviderError, "exited before responding"):
                 read_grok(config)
+
+
+class _FakeUsageResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self, limit: int = -1) -> bytes:
+        return self._body[:limit] if limit and limit > 0 else self._body
+
+    def __enter__(self) -> "_FakeUsageResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+class ClaudeUsageLaneTests(unittest.TestCase):
+    """The headless sample lane: OAuth usage poll with the CLI's stored token.
+
+    Claude quota previously reached the collector only through the interactive
+    status-line sensor, so wake-driven headless seats never produced a pool
+    sample and their pools sat permanently stale on the widget. These pin the
+    polling lane that closed that gap.
+    """
+
+    USAGE_DOCUMENT = {
+        "five_hour": {
+            "utilization": 8.0,
+            "resets_at": "2026-08-17T00:49:59.739253+00:00",
+        },
+        "seven_day": {
+            "utilization": 34.0,
+            "resets_at": "2026-08-22T17:59:59.739273+00:00",
+        },
+        "seven_day_opus": None,
+        "extra_usage": {"is_enabled": False},
+    }
+
+    def _auth_command(self, root: Path) -> list[str]:
+        script = write_executable(
+            root / "claude.py",
+            "#!/usr/bin/env python3\n"
+            "import pathlib\n"
+            f"print(pathlib.Path({str(FIXTURES / 'claude-auth-status.sanitized.json')!r}).read_text())\n",
+        )
+        return [sys.executable, str(script)]
+
+    def _write_credentials(
+        self,
+        config,
+        *,
+        token: str = "sk-test-access-token",
+        expires_in_ms: float = 3_600_000,
+    ) -> None:
+        config.provider_home.mkdir(parents=True, exist_ok=True)
+        (config.provider_home / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": token,
+                        "refreshToken": "sk-test-refresh-token",
+                        "expiresAt": time.time() * 1000 + expires_in_ms,
+                    }
+                }
+            )
+        )
+
+    def test_missing_or_empty_credentials_are_authentication_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(root, "claude")
+            with self.assertRaisesRegex(AuthenticationRequired, "no credentials"):
+                load_claude_access_token(config)
+            config.provider_home.mkdir(parents=True, exist_ok=True)
+            (config.provider_home / ".credentials.json").write_text(
+                json.dumps({"claudeAiOauth": {}})
+            )
+            with self.assertRaisesRegex(AuthenticationRequired, "no access token"):
+                load_claude_access_token(config)
+
+    def test_expired_token_is_refused_not_refreshed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(root, "claude")
+            self._write_credentials(config, expires_in_ms=-1_000)
+            with self.assertRaisesRegex(AuthenticationRequired, "expired"):
+                load_claude_access_token(config)
+
+    def test_usage_windows_map_percent_to_fraction_and_keep_resets(self):
+        windows = claude_usage_windows(self.USAGE_DOCUMENT)
+        self.assertEqual(
+            [(w.id, w.label, w.duration_minutes) for w in windows],
+            [("five-hour", "5h", 300), ("seven-day", "7d", 10_080)],
+        )
+        self.assertAlmostEqual(windows[0].utilization, 0.08)
+        self.assertAlmostEqual(windows[1].utilization, 0.34)
+        self.assertEqual(windows[0].resets_at, "2026-08-17T00:49:59Z")
+
+    def test_invalid_utilization_terminalizes_as_provider_error(self):
+        for bad in ("high", 150, float("nan"), True):
+            with self.assertRaises(ProviderError):
+                claude_usage_windows({"five_hour": {"utilization": bad}})
+
+    def test_read_claude_sends_stored_token_and_beta_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(
+                root, "claude", provider_command=self._auth_command(root)
+            )
+            self._write_credentials(config, token="sk-test-access-token")
+            seen: dict[str, object] = {}
+
+            def opener(request, timeout):
+                seen["url"] = request.full_url
+                seen["authorization"] = request.get_header("Authorization")
+                seen["beta"] = request.get_header("Anthropic-beta")
+                seen["timeout"] = timeout
+                return _FakeUsageResponse(json.dumps(self.USAGE_DOCUMENT).encode())
+
+            reading = read_claude(config, opener=opener)
+            self.assertEqual(seen["url"], CLAUDE_USAGE_ENDPOINT)
+            self.assertEqual(seen["authorization"], "Bearer sk-test-access-token")
+            self.assertEqual(seen["beta"], CLAUDE_USAGE_BETA_HEADER)
+            self.assertEqual(reading.status, "ok")
+            self.assertEqual(len(reading.windows), 2)
+            self.assertEqual(reading.pool_label, config.pool_label)
+
+    def test_unauthorized_poll_is_authentication_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(
+                root, "claude", provider_command=self._auth_command(root)
+            )
+            self._write_credentials(config)
+
+            def opener(request, timeout):
+                raise urllib.error.HTTPError(
+                    request.full_url, 401, "unauthorized", None, None
+                )
+
+            with self.assertRaisesRegex(AuthenticationRequired, "refused"):
+                read_claude(config, opener=opener)
+
+    def test_windowless_document_reports_billing_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(
+                root, "claude", provider_command=self._auth_command(root)
+            )
+            self._write_credentials(config)
+
+            def opener(request, timeout):
+                return _FakeUsageResponse(b'{"extra_usage": {"is_enabled": false}}')
+
+            reading = read_claude(config, opener=opener)
+            self.assertEqual(reading.status, "billing_unavailable")
+            self.assertEqual(reading.windows, [])
 
 
 if __name__ == "__main__":

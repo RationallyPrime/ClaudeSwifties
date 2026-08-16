@@ -1,10 +1,24 @@
-"""Credential-free adapters for Claude, Codex, and Grok Build."""
+"""Provider adapters for Claude, Codex, and Grok Build.
+
+Codex and Grok are credential-free: quota and identity arrive through the
+provider's own CLI in a supported request sequence. Claude has no headless
+usage command — quota windows reach an interactive session's status line and
+nowhere else — so its sample lane polls the OAuth usage endpoint with the
+access token the CLI already stores in the profile. That is the one deliberate
+exception to credential-freedom: read-only, same seat, sent only to the API
+that issued it, and the refresh token is never touched (refreshing behind the
+CLI's back would race its rotation and could log the seat out).
+"""
 
 from __future__ import annotations
 
 import json
 import math
 import subprocess
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,6 +69,124 @@ def poll_claude_identity(config: CollectorConfig) -> IdentityHint:
     if raw.get("loggedIn") is False or raw.get("authenticated") is False:
         raise AuthenticationRequired("Claude profile is not authenticated")
     return claude_identity(raw, config.identity_key)
+
+
+CLAUDE_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_USAGE_BETA_HEADER = "oauth-2025-04-20"
+_CLAUDE_USAGE_LIMIT_BYTES = 256 * 1024
+
+
+def load_claude_access_token(config: CollectorConfig) -> str:
+    """Read the profile's stored OAuth access token, refusing expired ones.
+
+    Only ``claudeAiOauth.accessToken`` is read. An expired token is
+    ``AuthenticationRequired`` rather than a refresh attempt: the CLI owns the
+    refresh token and its rotation, and the token becomes fresh again the next
+    time the seat runs.
+    """
+    path = config.provider_home / ".credentials.json"
+    try:
+        if path.stat().st_size > 64 * 1024:
+            raise ProviderError("Claude credentials file is oversized")
+        raw = json.loads(path.read_text())
+    except FileNotFoundError as error:
+        raise AuthenticationRequired("Claude profile holds no credentials") from error
+    except OSError as error:
+        raise ProviderError("Claude credentials could not be read") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProviderError("Claude credentials are malformed") from error
+    oauth = raw.get("claudeAiOauth") if isinstance(raw, dict) else None
+    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    if not isinstance(token, str) or not token.strip():
+        raise AuthenticationRequired("Claude profile holds no access token")
+    expires_at = oauth.get("expiresAt")
+    if (
+        not isinstance(expires_at, bool)
+        and isinstance(expires_at, (int, float))
+        and expires_at <= time.time() * 1000
+    ):
+        raise AuthenticationRequired("Claude access token is expired")
+    return token
+
+
+def claude_usage_windows(payload: dict[str, Any]) -> list[QuotaWindow]:
+    windows: list[QuotaWindow] = []
+    for key, identifier, label, duration in (
+        ("five_hour", "five-hour", "5h", 300),
+        ("seven_day", "seven-day", "7d", 10_080),
+    ):
+        raw = payload.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            raise ProviderError(f"Claude {key} window is malformed")
+        used = raw.get("utilization")
+        if (
+            isinstance(used, bool)
+            or not isinstance(used, (int, float))
+            or not math.isfinite(float(used))
+            or not 0 <= used <= 100
+        ):
+            raise ProviderError(f"Claude {key} utilization is invalid")
+        resets = raw.get("resets_at")
+        reset_at = (
+            isoformat(parse_timestamp(resets, f"Claude {key}.resets_at"))
+            if resets is not None
+            else None
+        )
+        windows.append(
+            QuotaWindow(identifier, label, duration, float(used) / 100, reset_at)
+        )
+    return windows
+
+
+def read_claude(
+    config: CollectorConfig,
+    *,
+    opener: Callable[[urllib.request.Request, float], Any] | None = None,
+) -> ProviderReading:
+    identity = poll_claude_identity(config)
+    token = load_claude_access_token(config)
+    request = urllib.request.Request(  # noqa: S310 — scheme is pinned https
+        CLAUDE_USAGE_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": CLAUDE_USAGE_BETA_HEADER,
+            "User-Agent": f"ai-usage-collector/{COLLECTOR_VERSION}",
+        },
+        method="GET",
+    )
+    open_request = opener or (
+        lambda req, timeout: urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+    )
+    try:
+        with open_request(request, config.request_timeout_seconds) as response:
+            body = response.read(_CLAUDE_USAGE_LIMIT_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise AuthenticationRequired(
+                "Claude usage endpoint refused the access token"
+            ) from error
+        raise ProviderError(
+            f"Claude usage endpoint returned HTTP {error.code}"
+        ) from error
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise ProviderError("Claude usage endpoint is unreachable") from error
+    if len(body) > _CLAUDE_USAGE_LIMIT_BYTES:
+        raise ProviderError("Claude usage endpoint returned an oversized document")
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProviderError("Claude usage endpoint returned malformed JSON") from error
+    if not isinstance(payload, dict):
+        raise ProviderError("Claude usage endpoint returned no object")
+    windows = claude_usage_windows(payload)
+    return ProviderReading(
+        identity,
+        windows,
+        "ok" if windows else "billing_unavailable",
+        config.pool_label,
+    )
 
 
 def select_codex_snapshot(result: dict[str, Any]) -> dict[str, Any]:
@@ -301,4 +433,4 @@ def collect_provider(config: CollectorConfig) -> ProviderReading:
         return read_codex(config)
     if config.provider == "grok":
         return read_grok(config)
-    raise ProviderError("Claude samples arrive through the local status-line sensor")
+    return read_claude(config)

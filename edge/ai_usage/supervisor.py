@@ -253,10 +253,7 @@ class Supervisor:
         return identity, status
 
     def _collect(self, state: RuntimeState, now: float) -> Observation | None:
-        if (
-            self.config.provider == "claude"
-            or now - state.sample_checked_at < self.config.sample_poll_seconds
-        ):
+        if now - state.sample_checked_at < self.config.sample_poll_seconds:
             return None
         state.sample_checked_at = now
         observed = utc_now()
