@@ -388,7 +388,10 @@ def grok_reading(
 
 def read_grok(config: CollectorConfig) -> ProviderReading:
     # This exact sequence intentionally creates no session, sends no prompt,
-    # invokes no tool, and never calls x.ai/auth/getBearerToken.
+    # invokes no tool, and never calls the bearer-token method. The x.ai
+    # extension methods are underscore-prefixed on the wire (ACP extension
+    # convention, verified against grok 1.0.4); the bare names answer
+    # JSON-RPC -32601.
     command = [*config.provider_command, "agent", "--no-leader", "stdio"]
     with JsonLineProcess(
         command,
@@ -399,9 +402,9 @@ def read_grok(config: CollectorConfig) -> ProviderReading:
         initialized = process.request(
             "initialize", {"protocolVersion": 1, "clientCapabilities": {}}
         )
-        auth_info = process.request("x.ai/auth/info", {})
+        auth_info = process.request("_x.ai/auth/info", {})
         try:
-            billing = process.request("x.ai/billing", {})
+            billing = process.request("_x.ai/billing", {})
         except AuthenticationRequired:
             raise
         except ProviderError:

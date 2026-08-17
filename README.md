@@ -54,8 +54,9 @@ Provider credentials remain inside provider-owned clients:
 - Codex uses `account/read` followed by `account/rateLimits/read` through its
   app-server.
 - Grok uses `grok agent --no-leader stdio`, then `initialize`,
-  `x.ai/auth/info`, and `x.ai/billing`. It creates no session, sends no prompt,
-  invokes no tool, and never calls `x.ai/auth/getBearerToken`.
+  `_x.ai/auth/info`, and `_x.ai/billing` (the x.ai extension methods are
+  underscore-prefixed on the wire). It creates no session, sends no prompt,
+  invokes no tool, and never calls the bearer-token method.
 
 No collector reads a browser cookie, exports an OAuth/provider bearer, or
 calls a private browser endpoint. Provider identifiers are normalized and
