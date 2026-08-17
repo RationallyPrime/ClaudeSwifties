@@ -1237,22 +1237,34 @@ export class UsageStore {
    * A subject pool conflict-marked only against twins that have since been
    * retired into it holds no live contradiction: retirement rewrites the
    * twin's conflict rows onto the pool itself, so every remaining row points
-   * the pool at itself. Identity evidence against a DIFFERENT pool is a real
-   * contradiction and keeps the conflict display.
+   * the pool at itself. Identity evidence against a DIFFERENT live pool is a
+   * real contradiction and keeps the conflict display. "Live" is the same
+   * window as liveContradictoryBindings (CURRENT_PROFILE_MS).
    *
    * Quota arithmetic (regression / invalid_reset) is not identity evidence,
    * even when one id column is NULL. Concurrent-session ambiguity names the
    * other pool in evidence_json, not in a column inequality.
    */
-  private maybeRestoreVerifiedIdentity(poolId: string, _observedAt: string): void {
-    const hintConflicts = this.db.query<{ count: number }, [string]>(`
+  private maybeRestoreVerifiedIdentity(poolId: string, observedAt: string): void {
+    const liveThreshold = new Date(
+      Date.parse(observedAt) - CURRENT_PROFILE_MS,
+    ).toISOString();
+    const hintConflicts = this.db.query<{ count: number }, [string, string]>(`
       SELECT COUNT(*) AS count FROM conflicts
       WHERE kind = 'identity_hint_conflict'
         AND (hinted_pool_id = ?1 OR matched_pool_id = ?1)
         AND hinted_pool_id IS NOT NULL
         AND matched_pool_id IS NOT NULL
         AND hinted_pool_id != matched_pool_id
-    `).get(poolId)?.count ?? 0;
+        AND EXISTS (
+          SELECT 1 FROM bindings
+          WHERE pool_id = CASE
+            WHEN conflicts.hinted_pool_id = ?1 THEN conflicts.matched_pool_id
+            ELSE conflicts.hinted_pool_id
+          END
+          AND last_seen_at >= ?2
+        )
+    `).get(poolId, liveThreshold)?.count ?? 0;
     if (hintConflicts > 0) return;
 
     const ambiguityRows = this.db.query<{
@@ -1271,15 +1283,16 @@ export class UsageStore {
         )
     `).all(poolId);
     const hasLiveAmbiguity = ambiguityRows.some((row) => {
-      if (row.hinted_pool_id === poolId || row.matched_pool_id === poolId) {
-        return true;
-      }
+      let contradictoryIds: string[] = [];
       try {
         const evidence = JSON.parse(row.evidence_json) as {
           contradictory_pool_ids?: unknown;
         };
-        return Array.isArray(evidence.contradictory_pool_ids) &&
-          evidence.contradictory_pool_ids.includes(poolId);
+        if (Array.isArray(evidence.contradictory_pool_ids)) {
+          contradictoryIds = evidence.contradictory_pool_ids.filter(
+            (id): id is string => typeof id === "string",
+          );
+        }
       } catch {
         console.error(
           `unparseable concurrent_session_ambiguity evidence_json on conflict ${row.id}; ` +
@@ -1287,6 +1300,17 @@ export class UsageStore {
         );
         return true;
       }
+      const others = new Set<string>();
+      if (row.hinted_pool_id && row.hinted_pool_id !== poolId) {
+        others.add(row.hinted_pool_id);
+      }
+      if (row.matched_pool_id && row.matched_pool_id !== poolId) {
+        others.add(row.matched_pool_id);
+      }
+      for (const id of contradictoryIds) {
+        if (id !== poolId) others.add(id);
+      }
+      return [...others].some((id) => this.poolHasLiveBinding(id, liveThreshold));
     });
     if (hasLiveAmbiguity) return;
 
@@ -1294,6 +1318,14 @@ export class UsageStore {
       UPDATE pools SET identity_state = 'verified'
       WHERE id = ? AND identity_state = 'conflict' AND subject_digest IS NOT NULL
     `).run(poolId);
+  }
+
+  private poolHasLiveBinding(poolId: string, threshold: string): boolean {
+    return (this.db.query<{ present: number }, [string, string]>(`
+      SELECT 1 AS present FROM bindings
+      WHERE pool_id = ? AND last_seen_at >= ?
+      LIMIT 1
+    `).get(poolId, threshold)?.present ?? 0) === 1;
   }
 
   private continuityMatches(observation: UsageObservation, excludePoolId: string): PoolRow[] {

@@ -2061,6 +2061,55 @@ describe("pool identity convergence", () => {
     store.close();
   });
 
+  test("a stale concurrent-session ambiguity does not block restore", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-y",
+      session_id: "session-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      pool_label: "Claude · Account A",
+      windows: windows(0.4, R1),
+    }), "2026-08-15T15:30:01Z");
+    const ambiguity = store.ingest(observation({
+      profile_id: "profile-y",
+      session_id: "session-b",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:30:30Z",
+      observed_at: "2026-08-15T15:30:31Z",
+      pool_label: "Claude · Account B",
+      windows: windows(0.2, R2),
+    }), "2026-08-15T15:30:32Z");
+    expect(ambiguity.outcome).toBe("conflict");
+
+    store.ingest(observation({
+      profile_id: "profile-x",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      sampled_at: "2026-08-15T15:46:00Z",
+      observed_at: "2026-08-15T15:46:01Z",
+      windows: windows(0.45, R1),
+    }), "2026-08-15T15:46:02Z");
+    store.ingest(observation({
+      profile_id: "profile-x",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:46:30Z",
+      observed_at: "2026-08-15T15:46:31Z",
+      pool_label: "Claude · Account A",
+      windows: windows(0.5, R1),
+    }), "2026-08-15T15:46:32Z");
+
+    const snapshot = store.snapshot("2026-08-15T15:47:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    const poolB = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B));
+    expect(poolA?.identity_state).toBe("verified");
+    expect(poolB?.identity_state).toBe("conflict");
+    store.close();
+  });
+
   test("a window-continuity binding to a subjectless twin merges when subject and windows both corroborate", async () => {
     const { store, dir } = await freshStore();
     store.ingest(observation({
