@@ -865,6 +865,25 @@ export class UsageStore {
       confidence = "profile_history";
     }
 
+    // A profile's next session starts with no binding of its own. Before its
+    // subject or continuity evidence arrives, the profile's most recent bound
+    // pool is the strongest available claim; minting instead would project one
+    // provisional tile per session per reset generation. Heartbeats without
+    // windows carry no quota evidence and still bind nothing.
+    if (
+      !pool && !observation.provider_subject && !existingBinding &&
+      observation.windows.length > 0
+    ) {
+      const carrier = this.latestProfileBinding(
+        observation.profile_id,
+        observation.provider,
+      );
+      if (carrier) {
+        pool = this.poolById(carrier.pool_id);
+        confidence = "profile_history";
+      }
+    }
+
     // A profile may begin reporting before its provider subject is available,
     // and every schema-2 import deliberately starts that way. When the subject
     // first appears, preserve the existing pool's stable id/order and attach
@@ -894,12 +913,19 @@ export class UsageStore {
         // deliberately ambiguous instead of being guessed together.
         const retirementCandidate = boundMatch ??
           (!existingBinding && matches.length === 1 ? matches[0] : undefined);
+        // A conflict-state subject pool must not deadlock retirement: the
+        // usual conflict source is this very split (the twin corroborating
+        // every observation the subject pool also corroborates), so requiring
+        // "verified" here would keep the twin alive forever.
         if (
           retirementCandidate &&
-          pool.identity_state === "verified" &&
+          (pool.identity_state === "verified" ||
+            pool.identity_state === "conflict") &&
           this.sharesExactContinuity(pool, observation)
         ) {
           this.retireProvisionalPool(retirementCandidate.id, pool.id);
+          this.maybeRestoreVerifiedIdentity(pool.id);
+          pool = this.poolById(pool.id) ?? pool;
         }
       }
     }
@@ -1180,6 +1206,41 @@ export class UsageStore {
       return "same";
     }
     return "accept";
+  }
+
+  private latestProfileBinding(
+    profileId: string,
+    provider: UsageProvider,
+  ): BindingRow | null {
+    return this.db.query<BindingRow, [string, UsageProvider]>(`
+      SELECT profile_id, session_key, provider, pool_id, label, source_host,
+             last_seen_at, binding_confidence
+      FROM bindings
+      WHERE profile_id = ? AND provider = ?
+      ORDER BY last_seen_at DESC
+      LIMIT 1
+    `).get(profileId, provider) ?? null;
+  }
+
+  /**
+   * A subject pool conflict-marked only against twins that have since been
+   * retired into it holds no live contradiction: retirement rewrites the
+   * twin's conflict rows onto the pool itself, so every remaining row points
+   * the pool at itself. Identity evidence against a DIFFERENT pool is a real
+   * contradiction and keeps the conflict display.
+   */
+  private maybeRestoreVerifiedIdentity(poolId: string): void {
+    const contradictions = this.db.query<{ count: number }, [string]>(`
+      SELECT COUNT(*) AS count FROM conflicts
+      WHERE (hinted_pool_id = ?1 OR matched_pool_id = ?1)
+        AND hinted_pool_id IS NOT matched_pool_id
+    `).get(poolId)?.count ?? 0;
+    if (contradictions === 0) {
+      this.db.query(`
+        UPDATE pools SET identity_state = 'verified'
+        WHERE id = ? AND identity_state = 'conflict' AND subject_digest IS NOT NULL
+      `).run(poolId);
+    }
   }
 
   private continuityMatches(observation: UsageObservation, excludePoolId: string): PoolRow[] {
