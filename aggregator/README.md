@@ -163,13 +163,13 @@ restarts even though the importer input has been removed.
 | `INVALID_AUTH_MAX_ATTEMPTS` | `20` | integer `1..1000` |
 | `INVALID_AUTH_WINDOW_SECONDS` | `60` | integer `1..3600` |
 | `REQUIRE_LEGACY_IMPORT` | `false` | `true/false/1/0` |
-| `EXPECTED_IDENTITY_KEY_ID` | unset | 16-character base64url `identity_key_id`; unset or empty disables the namespace guard |
+| `EXPECTED_IDENTITY_KEY_ID` | unset | 16-character base64url `identity_key_id`; unset or empty disables the namespace guard. Compose host / `.env` name: `USAGE_EXPECTED_IDENTITY_KEY_ID` |
 
 `READ_TOKEN` and `EDGE_CREDENTIALS_JSON` are mandatory. Set
 `EXPECTED_IDENTITY_KEY_ID` to the fleet fingerprint the collectors send
-(`identity_key_id`) once every collector has been re-provisioned; the checked-in
-`compose.yml` forwards the host / `.env` value into the container. Leave it
-unset to accept any well-formed fingerprint.
+(`identity_key_id`) once every collector has been re-provisioned. The checked-in
+`compose.yml` forwards host / `.env` `USAGE_EXPECTED_IDENTITY_KEY_ID` into that
+container variable. Leave it unset to accept any well-formed fingerprint.
 
 ## HTTP boundary
 
