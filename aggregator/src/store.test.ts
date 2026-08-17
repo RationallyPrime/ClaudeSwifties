@@ -1659,6 +1659,113 @@ describe("pool identity convergence", () => {
     store.close();
   });
 
+  test("a conflict-state twin still retires into the subject pool", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-y",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      pool_label: "Claude · Pool V",
+      windows: windows(0.5, R1),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.55, R1),
+    }), "2026-08-15T15:31:02Z");
+    // A brief second session of the twin's profile on another account is what
+    // writes concurrent_session_ambiguity and flips the twin to conflict.
+    const ambiguity = store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-2",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:10Z",
+      observed_at: "2026-08-15T15:31:11Z",
+      pool_label: "Claude · Account B",
+      windows: windows(0.2, R2),
+    }), "2026-08-15T15:31:12Z");
+    expect(ambiguity.outcome).toBe("conflict");
+    const before = store.snapshot("2026-08-15T15:31:20Z");
+    expect(before.pools).toHaveLength(3);
+    expect(before.pools.find((pool) => !pool.id.endsWith(SUBJECT_A) && !pool.id.endsWith(SUBJECT_B))
+      ?.identity_state).toBe("conflict");
+
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:32:00Z",
+      observed_at: "2026-08-15T15:32:01Z",
+      pool_label: "Claude · Pool V",
+      windows: windows(0.6, R1),
+    }), "2026-08-15T15:32:02Z");
+
+    const snapshot = store.snapshot("2026-08-15T15:33:00Z");
+    expect(snapshot.pools).toHaveLength(2);
+    expect(snapshot.pools.some((pool) =>
+      !pool.id.endsWith(SUBJECT_A) && !pool.id.endsWith(SUBJECT_B)
+    )).toBeFalse();
+    const poolV = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    expect(poolV?.windows[0]?.utilization).toBe(0.6);
+    expect(poolV?.profiles.find((entry) => entry.id === "profile-x")?.binding_confidence)
+      .toBe("subject");
+    store.close();
+  });
+
+  test("a conflict-state twin still promotes when the subject first appears", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      windows: windows(0.5, R1),
+    }), "2026-08-15T15:30:01Z");
+    const ambiguity = store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-2",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:30:10Z",
+      observed_at: "2026-08-15T15:30:11Z",
+      pool_label: "Claude · Account B",
+      windows: windows(0.2, R2),
+    }), "2026-08-15T15:30:12Z");
+    expect(ambiguity.outcome).toBe("conflict");
+    const twinId = store.snapshot("2026-08-15T15:30:20Z")
+      .pools.find((pool) => !pool.id.endsWith(SUBJECT_B))?.id;
+    expect(twinId).toBeDefined();
+
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      pool_label: "Claude · Account A",
+      windows: windows(0.55, R1),
+    }), "2026-08-15T15:31:02Z");
+
+    const snapshot = store.snapshot("2026-08-15T15:32:00Z");
+    expect(snapshot.pools).toHaveLength(2);
+    const promoted = snapshot.pools.find((pool) => pool.id === twinId);
+    const poolB = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B));
+    expect(promoted?.identity_state).toBe("conflict");
+    expect(promoted?.label).toBe("Claude · Account A");
+    expect(promoted?.windows[0]?.utilization).toBe(0.55);
+    expect(poolB?.identity_state).toBe("conflict");
+    store.close();
+  });
+
   test("retiring a twin restores verified when remaining conflict rows only name the subject pool", async () => {
     const { store } = await freshStore();
     store.ingest(observation({

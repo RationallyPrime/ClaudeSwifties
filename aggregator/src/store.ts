@@ -898,7 +898,7 @@ export class UsageStore {
     // first appears, preserve the existing pool's stable id/order and attach
     // the subject instead of projecting a duplicate verified pool. The bound
     // profile/session is the strongest candidate; without it, promotion is
-    // safe only when exact window continuity identifies one provisional pool.
+    // safe only when exact window continuity identifies one subjectless pool.
     if (observation.provider_subject) {
       const matches = this.provisionalContinuityMatches(observation);
       const boundMatch = existingBinding?.provider === observation.provider
@@ -911,21 +911,23 @@ export class UsageStore {
             promotionCandidate,
             observation.provider_subject,
           );
+          this.maybeRestoreVerifiedIdentity(pool.id, observation.observed_at);
           hintedPool = pool;
           confidence = "subject";
         }
       } else {
         // The subject may already have a canonical pool while this session is
-        // still bound to a subjectless provisional tile. Retire only that exact
-        // bound continuation. A legacy candidate without a live binding is
-        // also safe when it is the sole match; coincident imports remain
+        // still bound to a subjectless tile. Retire only that exact bound
+        // continuation. A legacy candidate without a live binding is also
+        // safe when it is the sole match; coincident imports remain
         // deliberately ambiguous instead of being guessed together.
         const retirementCandidate = boundMatch ??
           (!existingBinding && matches.length === 1 ? matches[0] : undefined);
-        // A conflict-state subject pool must not deadlock retirement: the
-        // usual conflict source is this very split (the twin corroborating
-        // every observation the subject pool also corroborates), so requiring
-        // "verified" here would keep the twin alive forever.
+        // Conflict state must not deadlock retirement on either side of the
+        // split. The usual conflict source is the split itself (the twin
+        // corroborates every observation the subject pool corroborates), so
+        // requiring "verified" on the subject or "provisional" on the twin
+        // would keep the extra tile alive forever.
         if (
           retirementCandidate &&
           (pool.identity_state === "verified" ||
@@ -933,7 +935,7 @@ export class UsageStore {
           this.sharesExactContinuity(pool, observation)
         ) {
           this.retireProvisionalPool(retirementCandidate.id, pool.id);
-          this.maybeRestoreVerifiedIdentity(pool.id);
+          this.maybeRestoreVerifiedIdentity(pool.id, observation.observed_at);
           pool = this.poolById(pool.id) ?? pool;
         }
       }
@@ -1242,7 +1244,7 @@ export class UsageStore {
    * even when one id column is NULL. Concurrent-session ambiguity names the
    * other pool in evidence_json, not in a column inequality.
    */
-  private maybeRestoreVerifiedIdentity(poolId: string): void {
+  private maybeRestoreVerifiedIdentity(poolId: string, _observedAt: string): void {
     const hintConflicts = this.db.query<{ count: number }, [string]>(`
       SELECT COUNT(*) AS count FROM conflicts
       WHERE kind = 'identity_hint_conflict'
@@ -1303,7 +1305,8 @@ export class UsageStore {
              sampled_at, received_at, sample_quality, windows_json,
              created_at, sort_order
       FROM pools
-      WHERE provider = ? AND subject_digest IS NULL AND identity_state = 'provisional'
+      WHERE provider = ? AND subject_digest IS NULL
+        AND identity_state IN ('provisional', 'conflict')
     `).all(observation.provider);
 
     return candidates.filter((candidate) => this.followsExactContinuity(candidate, observation));
@@ -1338,10 +1341,18 @@ export class UsageStore {
   }
 
   private promoteProvisionalPool(pool: PoolRow, subjectDigest: string): PoolRow {
+    // A conflict-state twin can still receive its subject. Keep the conflict
+    // until maybeRestoreVerifiedIdentity confirms no other live pool remains;
+    // blindly flipping to verified would clear a real concurrent-session split.
     this.db.query(`
       UPDATE pools
-      SET subject_digest = ?, identity_state = 'verified'
-      WHERE id = ? AND subject_digest IS NULL AND identity_state = 'provisional'
+      SET subject_digest = ?,
+          identity_state = CASE
+            WHEN identity_state = 'conflict' THEN 'conflict'
+            ELSE 'verified'
+          END
+      WHERE id = ? AND subject_digest IS NULL
+        AND identity_state IN ('provisional', 'conflict')
     `).run(subjectDigest, pool.id);
     return this.poolById(pool.id) as PoolRow;
   }
@@ -1368,7 +1379,8 @@ export class UsageStore {
     );
     const deleted = this.db.query(`
       DELETE FROM pools
-      WHERE id = ? AND subject_digest IS NULL AND identity_state = 'provisional'
+      WHERE id = ? AND subject_digest IS NULL
+        AND identity_state IN ('provisional', 'conflict')
     `).run(sourcePoolId);
     if (deleted.changes !== 1) {
       throw new Error("provisional pool retirement lost its guarded source row");
