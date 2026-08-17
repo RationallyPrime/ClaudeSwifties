@@ -1879,6 +1879,136 @@ describe("pool identity convergence", () => {
     store.close();
   });
 
+  test("an unparseable ambiguity row for another pool does not block restore", async () => {
+    const { store, dir } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-y",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      pool_label: "Claude · Pool V",
+      windows: windows(0.6, R1),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-x",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.55, R1),
+    }), "2026-08-15T15:31:02Z");
+    store.close();
+
+    const db = new Database(join(dir, "usage-v3.sqlite"));
+    db.query(`
+      INSERT INTO conflicts (
+        observation_id, profile_id, kind, hinted_pool_id, matched_pool_id,
+        created_at, evidence_json
+      ) VALUES (?, ?, 'concurrent_session_ambiguity', NULL, NULL, ?, ?)
+    `).run("unrelated-obs", "unrelated-profile", "2026-08-15T15:31:03Z", "{not json");
+    db.close();
+
+    const reopened = await openStore(dir, DEFAULT_STORE_OPTIONS);
+    reopened.ingest(observation({
+      profile_id: "profile-x",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:32:00Z",
+      observed_at: "2026-08-15T15:32:01Z",
+      pool_label: "Claude · Pool V",
+      windows: windows(0.55, R1),
+    }), "2026-08-15T15:32:02Z");
+    reopened.ingest(observation({
+      profile_id: "profile-x",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:33:00Z",
+      observed_at: "2026-08-15T15:33:01Z",
+      pool_label: "Claude · Pool V",
+      windows: windows(0.65, R1),
+    }), "2026-08-15T15:33:02Z");
+
+    const snapshot = reopened.snapshot("2026-08-15T15:34:00Z");
+    expect(snapshot.pools).toHaveLength(1);
+    expect(snapshot.pools[0]?.identity_state).toBe("verified");
+    reopened.close();
+  });
+
+  test("an unparseable ambiguity row that names the pool stays a loud scoped block", async () => {
+    const errors: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map(String).join(" "));
+    };
+    const { store, dir } = await freshStore();
+    try {
+      store.ingest(observation({
+        profile_id: "profile-y",
+        provider_subject: SUBJECT_A,
+        sequence: 1,
+        pool_label: "Claude · Pool V",
+        windows: windows(0.6, R1),
+      }), "2026-08-15T15:30:01Z");
+      store.ingest(observation({
+        profile_id: "profile-x",
+        provider_subject: null,
+        identity_evidence: "unknown",
+        sequence: 1,
+        sampled_at: "2026-08-15T15:31:00Z",
+        observed_at: "2026-08-15T15:31:01Z",
+        windows: windows(0.55, R1),
+      }), "2026-08-15T15:31:02Z");
+      const poolVId = store.snapshot("2026-08-15T15:31:30Z")
+        .pools.find((pool) => pool.id.endsWith(SUBJECT_A))?.id;
+      expect(poolVId).toBeDefined();
+      store.close();
+
+      const db = new Database(join(dir, "usage-v3.sqlite"));
+      db.query(`
+        INSERT INTO conflicts (
+          observation_id, profile_id, kind, hinted_pool_id, matched_pool_id,
+          created_at, evidence_json
+        ) VALUES (?, ?, 'concurrent_session_ambiguity', NULL, NULL, ?, ?)
+      `).run(
+        "broken-obs",
+        "profile-y",
+        "2026-08-15T15:31:03Z",
+        `{not json but names ${poolVId}`,
+      );
+      db.close();
+
+      const reopened = await openStore(dir, DEFAULT_STORE_OPTIONS);
+      reopened.ingest(observation({
+        profile_id: "profile-x",
+        provider_subject: SUBJECT_A,
+        sequence: 2,
+        sampled_at: "2026-08-15T15:32:00Z",
+        observed_at: "2026-08-15T15:32:01Z",
+        pool_label: "Claude · Pool V",
+        windows: windows(0.55, R1),
+      }), "2026-08-15T15:32:02Z");
+      reopened.ingest(observation({
+        profile_id: "profile-x",
+        provider_subject: SUBJECT_A,
+        sequence: 3,
+        sampled_at: "2026-08-15T15:33:00Z",
+        observed_at: "2026-08-15T15:33:01Z",
+        pool_label: "Claude · Pool V",
+        windows: windows(0.65, R1),
+      }), "2026-08-15T15:33:02Z");
+
+      const snapshot = reopened.snapshot("2026-08-15T15:34:00Z");
+      expect(snapshot.pools[0]?.identity_state).toBe("conflict");
+      expect(errors.some((line) =>
+        line.includes("unparseable concurrent_session_ambiguity") &&
+        line.includes(poolVId ?? "")
+      )).toBeTrue();
+      reopened.close();
+    } finally {
+      console.error = original;
+    }
+  });
+
   test("concurrent-session ambiguity keeps the conflict through an unrelated twin retirement", async () => {
     const { store } = await freshStore();
     store.ingest(observation({

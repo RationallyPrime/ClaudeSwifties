@@ -1256,14 +1256,20 @@ export class UsageStore {
     if (hintConflicts > 0) return;
 
     const ambiguityRows = this.db.query<{
+      id: number;
       hinted_pool_id: string | null;
       matched_pool_id: string | null;
       evidence_json: string;
-    }, []>(`
-      SELECT hinted_pool_id, matched_pool_id, evidence_json
+    }, [string]>(`
+      SELECT id, hinted_pool_id, matched_pool_id, evidence_json
       FROM conflicts
       WHERE kind = 'concurrent_session_ambiguity'
-    `).all();
+        AND (
+          hinted_pool_id = ?1
+          OR matched_pool_id = ?1
+          OR evidence_json LIKE '%' || ?1 || '%'
+        )
+    `).all(poolId);
     const hasLiveAmbiguity = ambiguityRows.some((row) => {
       if (row.hinted_pool_id === poolId || row.matched_pool_id === poolId) {
         return true;
@@ -1275,6 +1281,10 @@ export class UsageStore {
         return Array.isArray(evidence.contradictory_pool_ids) &&
           evidence.contradictory_pool_ids.includes(poolId);
       } catch {
+        console.error(
+          `unparseable concurrent_session_ambiguity evidence_json on conflict ${row.id}; ` +
+            `treating pool ${poolId} as still contradicted`,
+        );
         return true;
       }
     });
