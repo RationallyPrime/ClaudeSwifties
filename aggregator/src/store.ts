@@ -1119,6 +1119,9 @@ export class UsageStore {
     if (authenticatedPresence) {
       this.updateBinding(observation, pool.id, confidence, sessionKey);
     }
+    // Restore is time-varying (other-pool liveness). Promotion and retirement
+    // consume their own trigger, so a later observation must re-ask.
+    this.maybeRestoreVerifiedIdentity(pool.id, observation.observed_at);
     this.recordObservation(observation, receivedAt, outcome, pool.id, clockSkewed, sessionKey);
     this.recordLatestSessionObservation(
       observation,

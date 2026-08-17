@@ -1714,8 +1714,81 @@ describe("pool identity convergence", () => {
     )).toBeFalse();
     const poolV = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
     expect(poolV?.windows[0]?.utilization).toBe(0.6);
+    expect(poolV?.identity_state).toBe("conflict");
     expect(poolV?.profiles.find((entry) => entry.id === "profile-x")?.binding_confidence)
       .toBe("subject");
+    store.close();
+  });
+
+  test("a stale concurrent-session contradiction restores verified on a later observation", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-y",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      pool_label: "Claude · Pool V",
+      windows: windows(0.5, R1),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.55, R1),
+    }), "2026-08-15T15:31:02Z");
+    const ambiguity = store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-2",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:10Z",
+      observed_at: "2026-08-15T15:31:11Z",
+      pool_label: "Claude · Account B",
+      windows: windows(0.2, R2),
+    }), "2026-08-15T15:31:12Z");
+    expect(ambiguity.outcome).toBe("conflict");
+
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:32:00Z",
+      observed_at: "2026-08-15T15:32:01Z",
+      pool_label: "Claude · Pool V",
+      windows: windows(0.6, R1),
+    }), "2026-08-15T15:32:02Z");
+
+    const afterRetirement = store.snapshot("2026-08-15T15:33:00Z");
+    expect(afterRetirement.pools).toHaveLength(2);
+    expect(afterRetirement.pools.find((pool) => pool.id.endsWith(SUBJECT_A))?.identity_state)
+      .toBe("conflict");
+    expect(afterRetirement.pools.find((pool) => pool.id.endsWith(SUBJECT_B))?.identity_state)
+      .toBe("conflict");
+
+    // B has been quiet since 15:31:11. CURRENT_PROFILE_MS is 15 minutes;
+    // two hours later the contradiction is stale, but only a later
+    // observation of V can re-ask the restore predicate.
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: SUBJECT_A,
+      sequence: 4,
+      sampled_at: "2026-08-15T17:32:00Z",
+      observed_at: "2026-08-15T17:32:01Z",
+      pool_label: "Claude · Pool V",
+      windows: windows(0.61, R1),
+    }), "2026-08-15T17:32:02Z");
+
+    const snapshot = store.snapshot("2026-08-15T17:33:00Z");
+    expect(snapshot.pools).toHaveLength(2);
+    expect(snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A))?.identity_state)
+      .toBe("verified");
+    expect(snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B))?.identity_state)
+      .toBe("conflict");
     store.close();
   });
 
@@ -2160,5 +2233,70 @@ describe("pool identity convergence", () => {
       .toBe("subject");
     expect(reopened.conflictCount()).toBe(0);
     reopened.close();
+  });
+
+  test("coincident conflict and provisional twins stay ambiguous instead of promoting", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-1",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      windows: windows(0.5, R1),
+    }), "2026-08-15T15:30:01Z");
+    const ambiguity = store.ingest(observation({
+      profile_id: "profile-x",
+      session_id: "session-2",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:30:10Z",
+      observed_at: "2026-08-15T15:30:11Z",
+      pool_label: "Claude · Account B",
+      windows: windows(0.2, R2),
+    }), "2026-08-15T15:30:12Z");
+    expect(ambiguity.outcome).toBe("conflict");
+    store.ingest(observation({
+      profile_id: "profile-z",
+      session_id: "session-z",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      sampled_at: "2026-08-15T15:30:20Z",
+      observed_at: "2026-08-15T15:30:21Z",
+      windows: windows(0.5, R1),
+    }), "2026-08-15T15:30:22Z");
+    const before = store.snapshot("2026-08-15T15:30:30Z");
+    expect(before.pools).toHaveLength(3);
+    const conflictTwinId = before.pools.find((pool) =>
+      !pool.id.endsWith(SUBJECT_B) && pool.identity_state === "conflict"
+    )?.id;
+    const provisionalTwinId = before.pools.find((pool) =>
+      pool.identity_state === "provisional"
+    )?.id;
+    expect(conflictTwinId).toBeDefined();
+    expect(provisionalTwinId).toBeDefined();
+
+    store.ingest(observation({
+      profile_id: "profile-w",
+      session_id: "session-w",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      pool_label: "Claude · Account A",
+      windows: windows(0.55, R1),
+    }), "2026-08-15T15:31:02Z");
+
+    const snapshot = store.snapshot("2026-08-15T15:32:00Z");
+    expect(snapshot.pools).toHaveLength(4);
+    const promoted = snapshot.pools.find((pool) => pool.id === provisionalTwinId);
+    const conflictTwin = snapshot.pools.find((pool) => pool.id === conflictTwinId);
+    const fresh = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    expect(promoted?.identity_state).toBe("provisional");
+    expect(conflictTwin?.identity_state).toBe("conflict");
+    expect(fresh?.identity_state).toBe("verified");
+    expect(fresh?.id).not.toBe(provisionalTwinId);
+    store.close();
   });
 });
