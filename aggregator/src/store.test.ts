@@ -347,6 +347,99 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("a recently-reporting displaced instance is not retired", async () => {
+    const { store } = await freshStore();
+    const instanceA = VALID_OBSERVATION.observer_instance_id;
+    const instanceB = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 1,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Two live collectors on one profile. B is newer, A reported within
+    // CURRENT_PROFILE_MS: record the conflict, switch the row, but do not
+    // permanently fence A.
+    expect(store.ingest(observation({
+      observer_instance_id: instanceB,
+      sequence: 0,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.61),
+    }), "2026-08-15T15:31:02Z").outcome).toBe("accepted");
+
+    const aFollowUp = store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:30Z",
+      observed_at: "2026-08-15T15:31:31Z",
+      windows: windows(0.70),
+    }), "2026-08-15T15:31:32Z");
+    expect(aFollowUp.outcome).toBe("accepted");
+
+    const bFollowUp = store.ingest(observation({
+      observer_instance_id: instanceB,
+      sequence: 1,
+      sampled_at: "2026-08-15T15:31:40Z",
+      observed_at: "2026-08-15T15:31:41Z",
+      windows: windows(0.72),
+    }), "2026-08-15T15:31:42Z");
+    expect(bFollowUp.outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(instanceB);
+    expect(doctor[0]?.last_sequence).toBe(1);
+    expect(doctor[0]?.last_conflict?.kind).toBe("concurrent_observer_instances");
+    expect(store.snapshot("2026-08-15T15:32:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.72);
+    store.close();
+  });
+
+  test("ignored heartbeats keep a live collector from a delayed spool takeover", async () => {
+    const { store } = await freshStore();
+    const live = VALID_OBSERVATION.observer_instance_id;
+    const unseenStale = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 1,
+      provider_subject: null,
+      identity_evidence: "unknown",
+      status: "auth_expired",
+      windows: [],
+      sampled_at: "2026-08-15T15:30:00Z",
+      observed_at: "2026-08-15T15:30:01Z",
+    }), "2026-08-15T15:30:02Z").outcome).toBe("ignored");
+
+    // Delayed spool arrives after CURRENT_PROFILE_MS, so recency cannot
+    // save the live instance. Liveness must come from the ignored samples
+    // themselves; an accepted/conflict-only fence would be null and retire.
+    const delayed = store.ingest(observation({
+      observer_instance_id: unseenStale,
+      sequence: 80,
+      sampled_at: "2026-08-15T14:00:00Z",
+      observed_at: "2026-08-15T14:00:01Z",
+      windows: windows(0.9),
+    }), "2026-08-15T16:00:02Z");
+    expect(delayed.outcome).toBe("ignored");
+
+    const recovered = store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 2,
+      sampled_at: "2026-08-15T16:00:30Z",
+      observed_at: "2026-08-15T16:00:31Z",
+      windows: windows(0.5),
+    }), "2026-08-15T16:00:32Z");
+    expect(recovered.outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T16:01:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(live);
+    expect(doctor[0]?.last_sequence).toBe(2);
+    expect(doctor[0]?.last_conflict?.kind).toBe("stale_observer_instance");
+    expect(store.snapshot("2026-08-15T16:01:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.5);
+    store.close();
+  });
+
   test("doctor latest binding breaks last_seen_at ties by update order", async () => {
     const { store } = await freshStore();
     const observedAt = "2026-08-15T15:30:00Z";

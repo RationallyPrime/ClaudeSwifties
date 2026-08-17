@@ -835,11 +835,11 @@ export class UsageStore {
 
     // The sequence high-water mark is scoped to one installation generation:
     // (observer_instance_id, sequence). A never-retired instance whose
-    // observed_at is newer than the profile's last accepted sample is a
+    // observed_at is newer than the profile's last recorded sample is a
     // legitimate reinstall/relocation whose counter starts over. An unseen
     // older instance — typically a delayed spool — must not retire the
-    // current collector. A known displaced instance is retired below and
-    // cannot rotate back.
+    // current collector. A recently-reporting displaced instance stays
+    // eligible; only a stale one is retired and cannot rotate back.
     const sameInstance =
       sequence?.observer_instance_id === observation.observer_instance_id;
     if (
@@ -893,10 +893,12 @@ export class UsageStore {
 
     if (consumeSequence && sequence && !sameInstance) {
       // Receipt time cannot order generations: a delayed spool arrives now.
-      // Compare the incoming sample against the last state-changing
-      // observation so an unseen older instance cannot retire a live one.
-      const lastObservedAt = this.latestAcceptedObservedAt(observation.profile_id);
-      const incomingIsNewer = lastObservedAt === null ||
+      // Compare the incoming sample against every recorded observation —
+      // including ignored heartbeats — so an unseen older instance cannot
+      // retire a live one. A missing timestamp cannot establish that the
+      // incoming generation is newer, so refuse the switch.
+      const lastObservedAt = this.latestRecordedObservedAt(observation.profile_id);
+      const incomingIsNewer = lastObservedAt !== null &&
         Date.parse(observation.observed_at) > Date.parse(lastObservedAt);
       if (!incomingIsNewer) {
         this.recordConflict(observation, "stale_observer_instance", null, null, receivedAt, {
@@ -916,7 +918,9 @@ export class UsageStore {
 
       // Two live installations of one profile competing for its sequence is
       // configuration evidence, not something to resolve silently. Preserve
-      // it whenever the displaced instance reported recently.
+      // it whenever the displaced instance reported recently: record the
+      // conflict and keep both generations ingesting. Retirement is
+      // irreversible, so it is reserved for a stale displaced instance.
       const displacedRecently =
         sequence.observer_instance_id !== null &&
         sequence.updated_at !== null &&
@@ -936,7 +940,7 @@ export class UsageStore {
           },
         );
       }
-      if (sequence.observer_instance_id !== null) {
+      if (sequence.observer_instance_id !== null && !displacedRecently) {
         this.retireObserverInstance(
           observation.profile_id,
           sequence.observer_instance_id,
@@ -1600,12 +1604,11 @@ export class UsageStore {
     );
   }
 
-  private latestAcceptedObservedAt(profileId: string): string | null {
+  private latestRecordedObservedAt(profileId: string): string | null {
     return this.db.query<{ observed_at: string | null }, [string]>(`
       SELECT MAX(observed_at) AS observed_at
       FROM observations
       WHERE profile_id = ?
-        AND outcome IN ('accepted', 'conflict')
     `).get(profileId)?.observed_at ?? null;
   }
 
