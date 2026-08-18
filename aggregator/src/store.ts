@@ -1415,18 +1415,25 @@ export class UsageStore {
   }
 
   // A pool's stored window generation has lapsed relative to an observation
-  // when every stored reset boundary had already passed at the observation's
-  // sample time. The provider is then necessarily reporting a newer
-  // generation, so a reset-tuple mismatch is expected bookkeeping rather than
-  // evidence that the windows belong to a different account. Windows without
-  // any reset boundary cannot prove a lapse.
+  // when every stored boundary the observation *disagrees with* had already
+  // passed at the observation's sample time. Only a disagreeing boundary can
+  // testify against identity: a stored boundary the observation still reports
+  // unchanged is same-account corroboration, not contrary evidence. Judging
+  // the lapse per boundary is what makes the verdict reachable at all — a
+  // Claude observation carries both a five-hour and a seven-day window
+  // (`edge/ai_usage/claude_sensor.py`), and the weekly boundary outlives every
+  // five-hour starvation cycle, so requiring it to lapse too would withhold
+  // the verdict for up to a week. A mismatch with no disagreeing dated
+  // boundary — a shape change rather than a reset — cannot prove a lapse.
   private windowGenerationLapsed(pool: PoolRow, observation: UsageObservation): boolean {
-    const boundaries = parseStoredWindows(pool.windows_json)
+    const incoming = new Map(observation.windows.map((window) => [window.id, window.resets_at]));
+    const disagreeing = parseStoredWindows(pool.windows_json)
+      .filter((window) => !incoming.has(window.id) || incoming.get(window.id) !== window.resets_at)
       .map((window) => window.resets_at)
       .filter((resetsAt): resetsAt is string => resetsAt !== null);
-    if (boundaries.length === 0) return false;
+    if (disagreeing.length === 0) return false;
     const sampledMs = Date.parse(observation.sampled_at);
-    return boundaries.every((resetsAt) => Date.parse(resetsAt) <= sampledMs);
+    return disagreeing.every((resetsAt) => Date.parse(resetsAt) <= sampledMs);
   }
 
   private promoteProvisionalPool(pool: PoolRow, subjectDigest: string): PoolRow {
