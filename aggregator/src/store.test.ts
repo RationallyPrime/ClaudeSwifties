@@ -490,6 +490,74 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("one-second reset-boundary jitter is the same generation, not a new pool", async () => {
+    const { store } = await freshStore();
+    // Observed live 2026-08-18: Anthropic reports the same boundaries as
+    // 20:50:00/07:00:00 in one poll and 20:49:59/06:59:59 in the next.
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      windows: claudeWindows(0.11, "2026-08-15T18:00:00.000Z", {
+        resets_at: "2026-08-20T12:00:00.000Z",
+      }),
+    }), "2026-08-15T15:30:01Z");
+    const jittered = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T15:35:00Z",
+      observed_at: "2026-08-15T15:35:01Z",
+      windows: claudeWindows(0.12, "2026-08-15T17:59:59.000Z", {
+        resets_at: "2026-08-20T11:59:59.000Z",
+      }),
+    }), "2026-08-15T15:35:02Z");
+
+    expect(jittered.outcome).toBe("accepted");
+    const snapshot = store.snapshot("2026-08-15T15:36:00Z");
+    expect(snapshot.pools).toHaveLength(1);
+    expect(snapshot.pools[0]?.windows.find((w) => w.id === "five-hour")?.utilization).toBe(0.12);
+    expect(store.conflictCount()).toBe(0);
+    store.close();
+  });
+
+  test("a real five-hour reset still transitions within the same pool", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      windows: claudeWindows(0.8, "2026-08-15T18:00:00.000Z"),
+    }), "2026-08-15T15:30:01Z");
+    // Five hours later: a genuinely new generation, far beyond any jitter
+    // tolerance — must be accepted as a reset on the same pool, not merged
+    // as "the same boundary" and not minted as a twin.
+    const reset = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T18:05:00Z",
+      observed_at: "2026-08-15T18:05:01Z",
+      // The five-hour window resets to ~0; the weekly window keeps climbing —
+      // a weekly decrease without a weekly reset would be a real regression.
+      windows: claudeWindows(0.02, "2026-08-15T23:00:00.000Z", {
+        utilization: 0.41,
+      }),
+    }), "2026-08-15T18:05:02Z");
+
+    expect(reset.outcome).toBe("accepted");
+    const snapshot = store.snapshot("2026-08-15T18:06:00Z");
+    expect(snapshot.pools).toHaveLength(1);
+    expect(snapshot.pools[0]?.windows.find((w) => w.id === "five-hour")?.utilization).toBe(0.02);
+    expect(snapshot.pools[0]?.windows.find((w) => w.id === "five-hour")?.resets_at)
+      .toBe("2026-08-15T23:00:00.000Z");
+    store.close();
+  });
+
   test("a starved subject pool reclaims its session from a subjectless twin after its generation lapses", async () => {
     const { store } = await freshStore();
     // Generation 1: the subject pool is current.
