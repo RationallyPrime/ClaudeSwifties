@@ -865,12 +865,40 @@ export class UsageStore {
       confidence = "profile_history";
     }
 
+    // A profile's next session starts with no binding of its own. Inherit the
+    // profile's most recent same-provider pool only when that binding is still
+    // live and the incoming windows continue it. A re-login the collector
+    // cannot subject-identify is also a new session; without those guards it
+    // would overwrite a verified pool. Mint when the carrier is missing, stale,
+    // or discontinuous. Heartbeats without windows still bind nothing.
+    if (
+      !pool && !observation.provider_subject && !existingBinding &&
+      observation.windows.length > 0
+    ) {
+      const carrier = this.latestProfileBinding(
+        observation.profile_id,
+        observation.provider,
+      );
+      const carrierPool = carrier ? this.poolById(carrier.pool_id) : null;
+      const carrierLive = carrier !== null &&
+        Date.parse(observation.observed_at) - Date.parse(carrier.last_seen_at) <=
+          CURRENT_PROFILE_MS;
+      if (
+        carrierPool &&
+        carrierLive &&
+        this.followsExactContinuity(carrierPool, observation)
+      ) {
+        pool = carrierPool;
+        confidence = "profile_history";
+      }
+    }
+
     // A profile may begin reporting before its provider subject is available,
     // and every schema-2 import deliberately starts that way. When the subject
     // first appears, preserve the existing pool's stable id/order and attach
     // the subject instead of projecting a duplicate verified pool. The bound
     // profile/session is the strongest candidate; without it, promotion is
-    // safe only when exact window continuity identifies one provisional pool.
+    // safe only when exact window continuity identifies one subjectless pool.
     if (observation.provider_subject) {
       const matches = this.provisionalContinuityMatches(observation);
       const boundMatch = existingBinding?.provider === observation.provider
@@ -883,23 +911,32 @@ export class UsageStore {
             promotionCandidate,
             observation.provider_subject,
           );
+          this.maybeRestoreVerifiedIdentity(pool.id, observation.observed_at);
           hintedPool = pool;
           confidence = "subject";
         }
       } else {
         // The subject may already have a canonical pool while this session is
-        // still bound to a subjectless provisional tile. Retire only that exact
-        // bound continuation. A legacy candidate without a live binding is
-        // also safe when it is the sole match; coincident imports remain
+        // still bound to a subjectless tile. Retire only that exact bound
+        // continuation. A legacy candidate without a live binding is also
+        // safe when it is the sole match; coincident imports remain
         // deliberately ambiguous instead of being guessed together.
         const retirementCandidate = boundMatch ??
           (!existingBinding && matches.length === 1 ? matches[0] : undefined);
+        // Conflict state must not deadlock retirement on either side of the
+        // split. The usual conflict source is the split itself (the twin
+        // corroborates every observation the subject pool corroborates), so
+        // requiring "verified" on the subject or "provisional" on the twin
+        // would keep the extra tile alive forever.
         if (
           retirementCandidate &&
-          pool.identity_state === "verified" &&
+          (pool.identity_state === "verified" ||
+            pool.identity_state === "conflict") &&
           this.sharesExactContinuity(pool, observation)
         ) {
           this.retireProvisionalPool(retirementCandidate.id, pool.id);
+          this.maybeRestoreVerifiedIdentity(pool.id, observation.observed_at);
+          pool = this.poolById(pool.id) ?? pool;
         }
       }
     }
@@ -1082,6 +1119,9 @@ export class UsageStore {
     if (authenticatedPresence) {
       this.updateBinding(observation, pool.id, confidence, sessionKey);
     }
+    // Restore is time-varying (other-pool liveness). Promotion and retirement
+    // consume their own trigger, so a later observation must re-ask.
+    this.maybeRestoreVerifiedIdentity(pool.id, observation.observed_at);
     this.recordObservation(observation, receivedAt, outcome, pool.id, clockSkewed, sessionKey);
     this.recordLatestSessionObservation(
       observation,
@@ -1182,6 +1222,115 @@ export class UsageStore {
     return "accept";
   }
 
+  private latestProfileBinding(
+    profileId: string,
+    provider: UsageProvider,
+  ): BindingRow | null {
+    return this.db.query<BindingRow, [string, UsageProvider]>(`
+      SELECT profile_id, session_key, provider, pool_id, label, source_host,
+             last_seen_at, binding_confidence
+      FROM bindings
+      WHERE profile_id = ? AND provider = ?
+      ORDER BY last_seen_at DESC, session_key ASC
+      LIMIT 1
+    `).get(profileId, provider) ?? null;
+  }
+
+  /**
+   * A subject pool conflict-marked only against twins that have since been
+   * retired into it holds no live contradiction: retirement rewrites the
+   * twin's conflict rows onto the pool itself, so every remaining row points
+   * the pool at itself. Identity evidence against a DIFFERENT live pool is a
+   * real contradiction and keeps the conflict display. "Live" is the same
+   * window as liveContradictoryBindings (CURRENT_PROFILE_MS).
+   *
+   * Quota arithmetic (regression / invalid_reset) is not identity evidence,
+   * even when one id column is NULL. Concurrent-session ambiguity names the
+   * other pool in evidence_json, not in a column inequality.
+   */
+  private maybeRestoreVerifiedIdentity(poolId: string, observedAt: string): void {
+    const liveThreshold = new Date(
+      Date.parse(observedAt) - CURRENT_PROFILE_MS,
+    ).toISOString();
+    const hintConflicts = this.db.query<{ count: number }, [string, string]>(`
+      SELECT COUNT(*) AS count FROM conflicts
+      WHERE kind = 'identity_hint_conflict'
+        AND (hinted_pool_id = ?1 OR matched_pool_id = ?1)
+        AND hinted_pool_id IS NOT NULL
+        AND matched_pool_id IS NOT NULL
+        AND hinted_pool_id != matched_pool_id
+        AND EXISTS (
+          SELECT 1 FROM bindings
+          WHERE pool_id = CASE
+            WHEN conflicts.hinted_pool_id = ?1 THEN conflicts.matched_pool_id
+            ELSE conflicts.hinted_pool_id
+          END
+          AND last_seen_at >= ?2
+        )
+    `).get(poolId, liveThreshold)?.count ?? 0;
+    if (hintConflicts > 0) return;
+
+    const ambiguityRows = this.db.query<{
+      id: number;
+      hinted_pool_id: string | null;
+      matched_pool_id: string | null;
+      evidence_json: string;
+    }, [string]>(`
+      SELECT id, hinted_pool_id, matched_pool_id, evidence_json
+      FROM conflicts
+      WHERE kind = 'concurrent_session_ambiguity'
+        AND (
+          hinted_pool_id = ?1
+          OR matched_pool_id = ?1
+          OR evidence_json LIKE '%' || ?1 || '%'
+        )
+    `).all(poolId);
+    const hasLiveAmbiguity = ambiguityRows.some((row) => {
+      let contradictoryIds: string[] = [];
+      try {
+        const evidence = JSON.parse(row.evidence_json) as {
+          contradictory_pool_ids?: unknown;
+        };
+        if (Array.isArray(evidence.contradictory_pool_ids)) {
+          contradictoryIds = evidence.contradictory_pool_ids.filter(
+            (id): id is string => typeof id === "string",
+          );
+        }
+      } catch {
+        console.error(
+          `unparseable concurrent_session_ambiguity evidence_json on conflict ${row.id}; ` +
+            `treating pool ${poolId} as still contradicted`,
+        );
+        return true;
+      }
+      const others = new Set<string>();
+      if (row.hinted_pool_id && row.hinted_pool_id !== poolId) {
+        others.add(row.hinted_pool_id);
+      }
+      if (row.matched_pool_id && row.matched_pool_id !== poolId) {
+        others.add(row.matched_pool_id);
+      }
+      for (const id of contradictoryIds) {
+        if (id !== poolId) others.add(id);
+      }
+      return [...others].some((id) => this.poolHasLiveBinding(id, liveThreshold));
+    });
+    if (hasLiveAmbiguity) return;
+
+    this.db.query(`
+      UPDATE pools SET identity_state = 'verified'
+      WHERE id = ? AND identity_state = 'conflict' AND subject_digest IS NOT NULL
+    `).run(poolId);
+  }
+
+  private poolHasLiveBinding(poolId: string, threshold: string): boolean {
+    return (this.db.query<{ present: number }, [string, string]>(`
+      SELECT 1 AS present FROM bindings
+      WHERE pool_id = ? AND last_seen_at >= ?
+      LIMIT 1
+    `).get(poolId, threshold)?.present ?? 0) === 1;
+  }
+
   private continuityMatches(observation: UsageObservation, excludePoolId: string): PoolRow[] {
     if (resetTuple(observation.windows).length === 0) return [];
     const candidates = this.db.query<PoolRow, [UsageProvider, string]>(`
@@ -1201,7 +1350,8 @@ export class UsageStore {
              sampled_at, received_at, sample_quality, windows_json,
              created_at, sort_order
       FROM pools
-      WHERE provider = ? AND subject_digest IS NULL AND identity_state = 'provisional'
+      WHERE provider = ? AND subject_digest IS NULL
+        AND identity_state IN ('provisional', 'conflict')
     `).all(observation.provider);
 
     return candidates.filter((candidate) => this.followsExactContinuity(candidate, observation));
@@ -1236,10 +1386,18 @@ export class UsageStore {
   }
 
   private promoteProvisionalPool(pool: PoolRow, subjectDigest: string): PoolRow {
+    // A conflict-state twin can still receive its subject. Keep the conflict
+    // until maybeRestoreVerifiedIdentity confirms no other live pool remains;
+    // blindly flipping to verified would clear a real concurrent-session split.
     this.db.query(`
       UPDATE pools
-      SET subject_digest = ?, identity_state = 'verified'
-      WHERE id = ? AND subject_digest IS NULL AND identity_state = 'provisional'
+      SET subject_digest = ?,
+          identity_state = CASE
+            WHEN identity_state = 'conflict' THEN 'conflict'
+            ELSE 'verified'
+          END
+      WHERE id = ? AND subject_digest IS NULL
+        AND identity_state IN ('provisional', 'conflict')
     `).run(subjectDigest, pool.id);
     return this.poolById(pool.id) as PoolRow;
   }
@@ -1266,7 +1424,8 @@ export class UsageStore {
     );
     const deleted = this.db.query(`
       DELETE FROM pools
-      WHERE id = ? AND subject_digest IS NULL AND identity_state = 'provisional'
+      WHERE id = ? AND subject_digest IS NULL
+        AND identity_state IN ('provisional', 'conflict')
     `).run(sourcePoolId);
     if (deleted.changes !== 1) {
       throw new Error("provisional pool retirement lost its guarded source row");

@@ -58,9 +58,9 @@ for line in sys.stdin:
     method = message["method"]
     if method == "initialize":
         result = {"agentInfo": {"version": "0.2.0"}}
-    elif method == "x.ai/auth/info":
+    elif method == "_x.ai/auth/info":
         result = json.loads(auth_fixture.read_text())
-    elif method == "x.ai/billing":
+    elif method == "_x.ai/billing":
         result = json.loads(billing_fixture.read_text())
     else:
         print(json.dumps({"id": message["id"], "error": {"code": -32601, "message": "forbidden"}}), flush=True)
@@ -148,7 +148,7 @@ class GrokProviderTests(unittest.TestCase):
             )
             reading = read_grok(config)
             methods = log.read_text().splitlines()
-            self.assertEqual(methods, ["initialize", "x.ai/auth/info", "x.ai/billing"])
+            self.assertEqual(methods, ["initialize", "_x.ai/auth/info", "_x.ai/billing"])
             forbidden = ("getBearerToken", "session", "prompt", "tool")
             self.assertFalse(
                 any(any(word in method for word in forbidden) for method in methods)
@@ -214,7 +214,7 @@ import json, sys
 for line in sys.stdin:
     message = json.loads(line)
     if message["method"] == "initialize": result = {}
-    elif message["method"] == "x.ai/auth/info": result = {"email": "private@example.test"}
+    elif message["method"] == "_x.ai/auth/info": result = {"email": "private@example.test"}
     else:
         print(json.dumps({"jsonrpc":"2.0","id":message["id"],"error":{"code":401,"message":"Authentication required; run grok login"}}), flush=True)
         continue
