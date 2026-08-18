@@ -43,6 +43,33 @@ function windows(
   }];
 }
 
+// The shape a real Claude observation carries: a five-hour window plus a
+// seven-day window whose boundary outlives many five-hour generations
+// (`edge/ai_usage/claude_sensor.py`, and the `VALID_OBSERVATION` fixture).
+// The weekly window carries its own utilization because it does not reset
+// when the five-hour one does: across a five-hour reset its utilization must
+// still rise, or the observation reads as a regression on an unreset window.
+function claudeWindows(
+  utilization: number,
+  resetsAt: string | null = "2026-08-15T18:00:00.000Z",
+  weekly: { utilization?: number; resets_at?: string | null } = {},
+): UsageWindow[] {
+  const {
+    utilization: weeklyUtilization = utilization / 2,
+    resets_at: weeklyResetsAt = "2026-08-20T12:00:00.000Z",
+  } = weekly;
+  return [
+    ...windows(utilization, resetsAt),
+    {
+      id: "seven-day",
+      label: "7d",
+      duration_minutes: 10_080,
+      utilization: weeklyUtilization,
+      resets_at: weeklyResetsAt,
+    },
+  ];
+}
+
 async function freshStore(options: Partial<StoreOptions> = {}) {
   const dir = await mkdtemp(join(tmpdir(), "usage-v3-store-"));
   return {
@@ -460,6 +487,321 @@ describe("UsageStore schema-3 reconciliation", () => {
     expect(poolB?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
       .toBe("window_continuity");
     expect(store.conflictCount()).toBe(2);
+    store.close();
+  });
+
+  test("a starved subject pool reclaims its session from a subjectless twin after its generation lapses", async () => {
+    const { store } = await freshStore();
+    // Generation 1: the subject pool is current.
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      pool_label: "Claude · Max",
+      windows: windows(0.3, "2026-08-15T18:00:00.000Z"),
+    }), "2026-08-15T15:30:01Z");
+    // Identity goes briefly unobservable: a new session mints a subjectless
+    // twin on the next generation's windows.
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 2,
+      session_id: "session-2",
+      sampled_at: "2026-08-15T15:40:00Z",
+      observed_at: "2026-08-15T15:40:01Z",
+      windows: windows(0.1, "2026-08-15T19:00:00.000Z"),
+    }), "2026-08-15T15:40:02Z");
+    // While the subject pool's generation is still current, exact contrary
+    // continuity legitimately outranks the hint: the session binds to the
+    // twin and the subject pool starves from here on.
+    const stolen = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T16:00:00Z",
+      observed_at: "2026-08-15T16:00:01Z",
+      windows: windows(0.2, "2026-08-15T19:00:00.000Z"),
+    }), "2026-08-15T16:00:02Z");
+    expect(stolen.outcome).toBe("conflict");
+    const conflictsAfterTheft = store.conflictCount();
+
+    // The subject pool's stored generation has now lapsed entirely. The
+    // tuple mismatch is starvation, not contrary identity: the twin retires
+    // into the subject pool and the observation refreshes its windows.
+    const reclaimed = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 4,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T21:00:00Z",
+      observed_at: "2026-08-15T21:00:01Z",
+      windows: windows(0.5, "2026-08-15T19:00:00.000Z"),
+    }), "2026-08-15T21:00:02Z");
+
+    expect(reclaimed.outcome).toBe("accepted");
+    const snapshot = store.snapshot("2026-08-15T21:01:00Z");
+    expect(snapshot.pools).toHaveLength(1);
+    const poolA = snapshot.pools[0];
+    expect(poolA?.id.endsWith(SUBJECT_A)).toBe(true);
+    expect(poolA?.identity_state).toBe("verified");
+    expect(poolA?.windows[0]?.utilization).toBe(0.5);
+    expect(poolA?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("subject");
+    expect(store.conflictCount()).toBe(conflictsAfterTheft);
+    store.close();
+  });
+
+  test("a starved subject pool reclaims its session while its weekly window is still current", async () => {
+    // The production shape: every Claude observation carries a seven-day
+    // window alongside the five-hour one. A five-hour starvation cycle
+    // completes long before the weekly boundary, so the reclaim must turn on
+    // the boundary the observation actually disagrees with.
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      pool_label: "Claude · Max",
+      windows: claudeWindows(0.3, "2026-08-15T18:00:00.000Z"),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 2,
+      session_id: "session-2",
+      sampled_at: "2026-08-15T15:40:00Z",
+      observed_at: "2026-08-15T15:40:01Z",
+      windows: claudeWindows(0.1, "2026-08-15T19:00:00.000Z"),
+    }), "2026-08-15T15:40:02Z");
+    const stolen = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T16:00:00Z",
+      observed_at: "2026-08-15T16:00:01Z",
+      windows: claudeWindows(0.2, "2026-08-15T19:00:00.000Z"),
+    }), "2026-08-15T16:00:02Z");
+    expect(stolen.outcome).toBe("conflict");
+    const conflictsAfterTheft = store.conflictCount();
+
+    // 21:00: the five-hour boundary the observation disagrees with (18:00)
+    // has passed; the seven-day boundary is unchanged and still days away.
+    const reclaimed = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 4,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T21:00:00Z",
+      observed_at: "2026-08-15T21:00:01Z",
+      windows: claudeWindows(0.5, "2026-08-15T19:00:00.000Z"),
+    }), "2026-08-15T21:00:02Z");
+
+    expect(reclaimed.outcome).toBe("accepted");
+    const snapshot = store.snapshot("2026-08-15T21:01:00Z");
+    expect(snapshot.pools).toHaveLength(1);
+    const poolA = snapshot.pools[0];
+    expect(poolA?.id.endsWith(SUBJECT_A)).toBe(true);
+    expect(poolA?.identity_state).toBe("verified");
+    expect(poolA?.windows[0]?.utilization).toBe(0.5);
+    expect(poolA?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("subject");
+    expect(store.conflictCount()).toBe(conflictsAfterTheft);
+    store.close();
+  });
+
+  test("a still-current disagreeing window keeps the hint from claiming starvation", async () => {
+    // The other direction: when the weekly boundary itself disagrees and has
+    // not passed, the stored generation has not lapsed and the twin keeps the
+    // session. Only an unchanged boundary is corroboration.
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      pool_label: "Claude · Max",
+      windows: claudeWindows(0.3, "2026-08-15T18:00:00.000Z"),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 2,
+      session_id: "session-2",
+      sampled_at: "2026-08-15T15:40:00Z",
+      observed_at: "2026-08-15T15:40:01Z",
+      windows: claudeWindows(0.1, "2026-08-15T19:00:00.000Z", {
+        resets_at: "2026-08-22T12:00:00.000Z",
+      }),
+    }), "2026-08-15T15:40:02Z");
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T16:00:00Z",
+      observed_at: "2026-08-15T16:00:01Z",
+      windows: claudeWindows(0.2, "2026-08-15T19:00:00.000Z", {
+        resets_at: "2026-08-22T12:00:00.000Z",
+      }),
+    }), "2026-08-15T16:00:02Z");
+
+    const held = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 4,
+      session_id: "session-1",
+      sampled_at: "2026-08-15T21:00:00Z",
+      observed_at: "2026-08-15T21:00:01Z",
+      windows: claudeWindows(0.5, "2026-08-15T19:00:00.000Z", {
+        resets_at: "2026-08-22T12:00:00.000Z",
+      }),
+    }), "2026-08-15T21:00:02Z");
+
+    expect(held.outcome).toBe("conflict");
+    const snapshot = store.snapshot("2026-08-15T21:01:00Z");
+    expect(snapshot.pools).toHaveLength(2);
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    expect(poolA?.identity_state).toBe("conflict");
+    expect(poolA?.windows[0]?.utilization).toBe(0.3);
+    // The twin, not the hint, still holds the session by exact continuity:
+    // a lapse claim that ignored the still-current weekly disagreement would
+    // strand the session on a third provisional pool instead.
+    expect(poolA?.profiles).toHaveLength(0);
+    const twin = snapshot.pools.find((pool) => !pool.id.endsWith(SUBJECT_A));
+    expect(twin?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("window_continuity");
+    store.close();
+  });
+
+  test("a lapsed hint mismatch does not reroute a fresh session onto a subjectless twin", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      windows: windows(0.3, "2026-08-15T18:00:00.000Z"),
+    }), "2026-08-15T15:30:01Z");
+    // A subjectless twin exists on the current generation.
+    store.ingest(observation({
+      profile_id: "profile-b",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      session_id: "session-2",
+      sampled_at: "2026-08-15T21:00:00Z",
+      observed_at: "2026-08-15T21:00:01Z",
+      windows: windows(0.1, "2026-08-16T02:00:00.000Z"),
+    }), "2026-08-15T21:00:02Z");
+    // A fresh session with live subject evidence and the subject pool's
+    // generation lapsed: identity must win; the twin gains nothing.
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      session_id: "session-3",
+      sampled_at: "2026-08-15T21:10:00Z",
+      observed_at: "2026-08-15T21:10:01Z",
+      windows: windows(0.15, "2026-08-16T02:00:00.000Z"),
+    }), "2026-08-15T21:10:02Z");
+
+    const snapshot = store.snapshot("2026-08-15T21:11:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    expect(poolA?.windows[0]?.utilization).toBe(0.15);
+    expect(poolA?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("subject");
+    store.close();
+  });
+
+  test("a lapsed hint keeps a fresh session off a subjectless twin under a live weekly window", async () => {
+    // The same refusal as above at the second guard site, in the collector's
+    // real two-window shape: the weekly boundary the observation still agrees
+    // with must not veto the five-hour lapse.
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      windows: claudeWindows(0.3, "2026-08-15T18:00:00.000Z", { utilization: 0.2 }),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-b",
+      provider_subject: null,
+      identity_evidence: "unknown",
+      sequence: 1,
+      session_id: "session-2",
+      sampled_at: "2026-08-15T21:00:00Z",
+      observed_at: "2026-08-15T21:00:01Z",
+      windows: claudeWindows(0.1, "2026-08-16T02:00:00.000Z", { utilization: 0.05 }),
+    }), "2026-08-15T21:00:02Z");
+    // The five-hour window reset; the weekly one did not, so its utilization
+    // keeps climbing past the hinted pool's stored value.
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      session_id: "session-3",
+      sampled_at: "2026-08-15T21:10:00Z",
+      observed_at: "2026-08-15T21:10:01Z",
+      windows: claudeWindows(0.15, "2026-08-16T02:00:00.000Z", { utilization: 0.22 }),
+    }), "2026-08-15T21:10:02Z");
+
+    const snapshot = store.snapshot("2026-08-15T21:11:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    expect(poolA?.windows[0]?.utilization).toBe(0.15);
+    expect(poolA?.profiles.find((profile) => profile.id === "profile-a")?.binding_confidence)
+      .toBe("subject");
+    store.close();
+  });
+
+  test("a lapsed hint still yields to contrary continuity carrying its own subject", async () => {
+    const { store } = await freshStore();
+    store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      session_id: "session-1",
+      pool_label: "Claude · Pool A",
+      windows: windows(0.3, "2026-08-15T18:00:00.000Z"),
+    }), "2026-08-15T15:30:01Z");
+    store.ingest(observation({
+      profile_id: "profile-b",
+      provider_subject: SUBJECT_B,
+      sequence: 1,
+      session_id: "session-b",
+      pool_label: "Claude · Pool B",
+      sampled_at: "2026-08-15T20:55:00Z",
+      observed_at: "2026-08-15T20:55:01Z",
+      windows: windows(0.4, "2026-08-16T02:00:00.000Z"),
+    }), "2026-08-15T20:55:02Z");
+    // Pool A's generation has lapsed, but the exact continuation belongs to
+    // a pool with its own subject — real contrary identity (#81231) still
+    // outranks the stale hint.
+    const result = store.ingest(observation({
+      profile_id: "profile-a",
+      provider_subject: SUBJECT_A,
+      sequence: 2,
+      session_id: "session-3",
+      sampled_at: "2026-08-15T21:00:00Z",
+      observed_at: "2026-08-15T21:00:01Z",
+      windows: windows(0.42, "2026-08-16T02:00:00.000Z"),
+    }), "2026-08-15T21:00:02Z");
+
+    expect(result.outcome).toBe("conflict");
+    const snapshot = store.snapshot("2026-08-15T21:01:00Z");
+    const poolA = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_A));
+    const poolB = snapshot.pools.find((pool) => pool.id.endsWith(SUBJECT_B));
+    expect(poolA?.windows[0]?.utilization).toBe(0.3);
+    expect(poolB?.windows[0]?.utilization).toBe(0.42);
+    expect(poolA?.identity_state).toBe("conflict");
     store.close();
   });
 
