@@ -961,11 +961,29 @@ export class UsageStore {
       const boundStillMatches = boundPool
         ? this.followsExactContinuity(boundPool, observation)
         : false;
-      // Yield to the subject hint only when its windows corroborate the hint
-      // and no longer corroborate the established continuity binding. If both
-      // pools happen to match, the new evidence is ambiguous rather than a
-      // proven identity realignment.
-      if (boundPool && (!hintedStillMatches || boundStillMatches)) {
+      if (
+        boundPool &&
+        boundPool.subject_digest === null &&
+        boundStillMatches &&
+        this.windowGenerationLapsed(hintedPool, observation)
+      ) {
+        // The bound pool is a subjectless twin and the hinted pool's window
+        // generation lapsed while the twin held this session: the tuple
+        // mismatch is starvation (the subject pool stopped receiving the
+        // observations that would have kept it current), not contrary
+        // identity. Identity evidence yields only to contrary identity
+        // evidence, never to its absence — fold the twin back into the
+        // subject's pool and let this observation refresh its windows.
+        this.retireProvisionalPool(boundPool.id, hintedPool.id);
+        this.maybeRestoreVerifiedIdentity(hintedPool.id, observation.observed_at);
+        pool = this.poolById(hintedPool.id) ?? hintedPool;
+        hintedPool = pool;
+        confidence = "subject";
+      } else if (boundPool && (!hintedStillMatches || boundStillMatches)) {
+        // Yield to the subject hint only when its windows corroborate the hint
+        // and no longer corroborate the established continuity binding. If both
+        // pools happen to match, the new evidence is ambiguous rather than a
+        // proven identity realignment.
         pool = boundPool;
         confidence = "window_continuity";
         carriedContinuityBinding = true;
@@ -1008,8 +1026,19 @@ export class UsageStore {
     if (!carriedContinuityBinding && hintedPool && observation.provider === "claude" &&
         resetTuple(parseStoredWindows(hintedPool.windows_json)) !== resetTuple(observation.windows)) {
       const matches = this.continuityMatches(observation, hintedPool.id);
-      if (matches.length === 1) {
-        pool = matches[0] ?? null;
+      const match = matches.length === 1 ? matches[0] : undefined;
+      // A subjectless continuity match against a hinted pool whose window
+      // generation has lapsed is starvation, not contrary identity: the
+      // mismatch proves only that the subject pool missed a generation while
+      // something else received its observations. Only a match carrying its
+      // own subject — a real other account — or a still-current hinted
+      // generation may outrank the identity hint.
+      if (
+        match &&
+        (match.subject_digest !== null ||
+          !this.windowGenerationLapsed(hintedPool, observation))
+      ) {
+        pool = match;
         confidence = "window_continuity";
         forcedConflict = true;
         this.markPoolConflict(hintedPool.id);
@@ -1383,6 +1412,21 @@ export class UsageStore {
         ? incoming.utilization + this.options.regressionTolerance >= previous.utilization
         : previous.utilization + this.options.regressionTolerance >= incoming.utilization;
     });
+  }
+
+  // A pool's stored window generation has lapsed relative to an observation
+  // when every stored reset boundary had already passed at the observation's
+  // sample time. The provider is then necessarily reporting a newer
+  // generation, so a reset-tuple mismatch is expected bookkeeping rather than
+  // evidence that the windows belong to a different account. Windows without
+  // any reset boundary cannot prove a lapse.
+  private windowGenerationLapsed(pool: PoolRow, observation: UsageObservation): boolean {
+    const boundaries = parseStoredWindows(pool.windows_json)
+      .map((window) => window.resets_at)
+      .filter((resetsAt): resetsAt is string => resetsAt !== null);
+    if (boundaries.length === 0) return false;
+    const sampledMs = Date.parse(observation.sampled_at);
+    return boundaries.every((resetsAt) => Date.parse(resetsAt) <= sampledMs);
   }
 
   private promoteProvisionalPool(pool: PoolRow, subjectDigest: string): PoolRow {
