@@ -1024,7 +1024,7 @@ export class UsageStore {
     // windows are a continuation of B. An exact B continuity match is stronger
     // than a contradictory Claude identity hint and must never overwrite A.
     if (!carriedContinuityBinding && hintedPool && observation.provider === "claude" &&
-        resetTuple(parseStoredWindows(hintedPool.windows_json)) !== resetTuple(observation.windows)) {
+        !sameResetTuple(parseStoredWindows(hintedPool.windows_json), observation.windows)) {
       const matches = this.continuityMatches(observation, hintedPool.id);
       const match = matches.length === 1 ? matches[0] : undefined;
       // A subjectless continuity match against a hinted pool whose window
@@ -1215,7 +1215,7 @@ export class UsageStore {
       const previous = existing.find((window) => window.id === incoming.id);
       if (!previous) continue;
 
-      if (previous.resets_at === incoming.resets_at) {
+      if (sameBoundary(previous.resets_at, incoming.resets_at)) {
         if (incoming.utilization + this.options.regressionTolerance < previous.utilization) {
           return "regression";
         }
@@ -1387,10 +1387,9 @@ export class UsageStore {
   }
 
   private followsExactContinuity(pool: PoolRow, observation: UsageObservation): boolean {
-    const incomingTuple = resetTuple(observation.windows);
-    if (incomingTuple.length === 0) return false;
+    if (observation.windows.length === 0) return false;
     const windows = parseStoredWindows(pool.windows_json);
-    if (resetTuple(windows) !== incomingTuple) return false;
+    if (!sameResetTuple(windows, observation.windows)) return false;
     if (Date.parse(observation.sampled_at) < Date.parse(pool.sampled_at)) return false;
     return observation.windows.every((incoming) => {
       const previous = windows.find((window) => window.id === incoming.id);
@@ -1400,10 +1399,9 @@ export class UsageStore {
   }
 
   private sharesExactContinuity(pool: PoolRow, observation: UsageObservation): boolean {
-    const incomingTuple = resetTuple(observation.windows);
-    if (incomingTuple.length === 0) return false;
+    if (observation.windows.length === 0) return false;
     const windows = parseStoredWindows(pool.windows_json);
-    if (resetTuple(windows) !== incomingTuple) return false;
+    if (!sameResetTuple(windows, observation.windows)) return false;
     const incomingIsNewer = Date.parse(observation.sampled_at) >= Date.parse(pool.sampled_at);
     return observation.windows.every((incoming) => {
       const previous = windows.find((window) => window.id === incoming.id);
@@ -1428,7 +1426,9 @@ export class UsageStore {
   private windowGenerationLapsed(pool: PoolRow, observation: UsageObservation): boolean {
     const incoming = new Map(observation.windows.map((window) => [window.id, window.resets_at]));
     const disagreeing = parseStoredWindows(pool.windows_json)
-      .filter((window) => !incoming.has(window.id) || incoming.get(window.id) !== window.resets_at)
+      .filter((window) =>
+        !incoming.has(window.id) ||
+        !sameBoundary(incoming.get(window.id) ?? null, window.resets_at))
       .map((window) => window.resets_at)
       .filter((resetsAt): resetsAt is string => resetsAt !== null);
     if (disagreeing.length === 0) return false;
@@ -1743,6 +1743,29 @@ function resetTuple(windows: UsageWindow[]): string {
     .map((window) => `${window.id}:${window.resets_at ?? "none"}`)
     .sort()
     .join("|");
+}
+
+// Anthropic's usage endpoint jitters reset boundaries between samples — the
+// same five-hour boundary arrives as 20:50:00 in one poll and 20:49:59 in the
+// next. Exact-string tuple equality read that jitter as a new quota
+// generation, which minted a fresh provisional twin (or rerouted a subject
+// hint) on every flip. Boundaries within this tolerance are the same
+// boundary; real window generations sit hours apart, so the margin is ~150×
+// the observed jitter and a vanishing fraction of any window span.
+const RESET_JITTER_TOLERANCE_MS = 120_000;
+
+function sameBoundary(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === b;
+  return Math.abs(Date.parse(a) - Date.parse(b)) <= RESET_JITTER_TOLERANCE_MS;
+}
+
+function sameResetTuple(a: UsageWindow[], b: UsageWindow[]): boolean {
+  if (a.length !== b.length) return false;
+  const byId = new Map(b.map((window) => [window.id, window]));
+  return a.every((window) => {
+    const other = byId.get(window.id);
+    return other !== undefined && sameBoundary(window.resets_at, other.resets_at);
+  });
 }
 
 function parseStoredWindows(raw: string): UsageWindow[] {
