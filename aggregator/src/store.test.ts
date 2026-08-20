@@ -263,6 +263,272 @@ describe("UsageStore schema-3 reconciliation", () => {
     store.close();
   });
 
+  test("a retired observer instance cannot reclaim the profile", async () => {
+    const { store } = await freshStore();
+    const instanceA = VALID_OBSERVATION.observer_instance_id;
+    const instanceB = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 1,
+      provider_subject: SUBJECT_A,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Reinstall a day later: ordinary displacement, no concurrent-instance
+    // noise. An old A spool arriving afterwards must not rotate the active
+    // generation or rewrite the binding back onto A's pool.
+    expect(store.ingest(observation({
+      observer_instance_id: instanceB,
+      sequence: 0,
+      provider_subject: SUBJECT_B,
+      sampled_at: "2026-08-16T15:30:00Z",
+      observed_at: "2026-08-16T15:30:01Z",
+      windows: windows(0.61),
+    }), "2026-08-16T15:30:02Z").outcome).toBe("accepted");
+
+    const reclaim = store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 2,
+      provider_subject: SUBJECT_A,
+      sampled_at: "2026-08-16T15:31:00Z",
+      observed_at: "2026-08-16T15:31:01Z",
+      windows: windows(0.7),
+    }), "2026-08-16T15:31:02Z");
+    expect(reclaim.outcome).toBe("ignored");
+
+    const doctor = store.doctorProfiles("2026-08-16T15:32:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(instanceB);
+    expect(doctor[0]?.last_sequence).toBe(0);
+    expect(doctor[0]?.last_conflict?.kind).toBe("retired_observer_instance");
+    const snapshot = store.snapshot("2026-08-16T15:32:00Z");
+    const bound = snapshot.pools.find((pool) => pool.id === doctor[0]?.pool_id);
+    expect(bound?.windows[0]?.utilization).toBe(0.61);
+    store.close();
+  });
+
+  test("an unseen stale instance cannot retire a live collector", async () => {
+    const { store } = await freshStore();
+    const live = VALID_OBSERVATION.observer_instance_id;
+    const unseenStale = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 1,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Delayed spool from an older UUID this database has never seen. Receipt
+    // is now, but the sample predates the live collector. Retiring the live
+    // instance here would make every subsequent live observation `ignored`.
+    const delayed = store.ingest(observation({
+      observer_instance_id: unseenStale,
+      sequence: 80,
+      sampled_at: "2026-08-15T14:00:00Z",
+      observed_at: "2026-08-15T14:00:01Z",
+      windows: windows(0.9),
+    }), "2026-08-15T15:31:00Z");
+    expect(delayed.outcome).toBe("ignored");
+
+    const followUp = store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:30Z",
+      observed_at: "2026-08-15T15:31:31Z",
+      windows: windows(0.52),
+    }), "2026-08-15T15:31:32Z");
+    expect(followUp.outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(live);
+    expect(doctor[0]?.last_sequence).toBe(2);
+    expect(doctor[0]?.last_conflict?.kind).toBe("stale_observer_instance");
+    expect(store.snapshot("2026-08-15T15:32:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.52);
+    store.close();
+  });
+
+  test("an unseen stale instance cannot take over after the live collector goes quiet", async () => {
+    const { store } = await freshStore();
+    const live = VALID_OBSERVATION.observer_instance_id;
+    const unseenStale = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 1,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    const delayed = store.ingest(observation({
+      observer_instance_id: unseenStale,
+      sequence: 80,
+      sampled_at: "2026-08-15T14:00:00Z",
+      observed_at: "2026-08-15T14:00:01Z",
+      windows: windows(0.9),
+    }), "2026-08-16T15:30:02Z");
+    expect(delayed.outcome).toBe("ignored");
+
+    const doctor = store.doctorProfiles("2026-08-16T15:31:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(live);
+    expect(doctor[0]?.last_sequence).toBe(1);
+    expect(doctor[0]?.last_conflict?.kind).toBe("stale_observer_instance");
+    expect(store.snapshot("2026-08-16T15:31:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.5);
+    store.close();
+  });
+
+  test("a recently-reporting displaced instance is not retired", async () => {
+    const { store } = await freshStore();
+    const instanceA = VALID_OBSERVATION.observer_instance_id;
+    const instanceB = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 1,
+      windows: windows(0.5),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+
+    // Two live collectors on one profile. B is newer, A reported within
+    // CURRENT_PROFILE_MS: record the conflict, switch the row, but do not
+    // permanently fence A.
+    expect(store.ingest(observation({
+      observer_instance_id: instanceB,
+      sequence: 0,
+      sampled_at: "2026-08-15T15:31:00Z",
+      observed_at: "2026-08-15T15:31:01Z",
+      windows: windows(0.61),
+    }), "2026-08-15T15:31:02Z").outcome).toBe("accepted");
+
+    const aFollowUp = store.ingest(observation({
+      observer_instance_id: instanceA,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:31:30Z",
+      observed_at: "2026-08-15T15:31:31Z",
+      windows: windows(0.70),
+    }), "2026-08-15T15:31:32Z");
+    expect(aFollowUp.outcome).toBe("accepted");
+
+    const bFollowUp = store.ingest(observation({
+      observer_instance_id: instanceB,
+      sequence: 1,
+      sampled_at: "2026-08-15T15:31:40Z",
+      observed_at: "2026-08-15T15:31:41Z",
+      windows: windows(0.72),
+    }), "2026-08-15T15:31:42Z");
+    expect(bFollowUp.outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:32:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(instanceB);
+    expect(doctor[0]?.last_sequence).toBe(1);
+    expect(doctor[0]?.last_conflict?.kind).toBe("concurrent_observer_instances");
+    expect(store.snapshot("2026-08-15T15:32:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.72);
+    store.close();
+  });
+
+  test("ignored heartbeats keep a live collector from a delayed spool takeover", async () => {
+    const { store } = await freshStore();
+    const live = VALID_OBSERVATION.observer_instance_id;
+    const unseenStale = randomUUID();
+    expect(store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 1,
+      provider_subject: null,
+      identity_evidence: "unknown",
+      status: "auth_expired",
+      windows: [],
+      sampled_at: "2026-08-15T15:30:00Z",
+      observed_at: "2026-08-15T15:30:01Z",
+    }), "2026-08-15T15:30:02Z").outcome).toBe("ignored");
+
+    // Delayed spool arrives after CURRENT_PROFILE_MS, so recency cannot
+    // save the live instance. Liveness must come from the ignored samples
+    // themselves; an accepted/conflict-only fence would be null and retire.
+    const delayed = store.ingest(observation({
+      observer_instance_id: unseenStale,
+      sequence: 80,
+      sampled_at: "2026-08-15T14:00:00Z",
+      observed_at: "2026-08-15T14:00:01Z",
+      windows: windows(0.9),
+    }), "2026-08-15T16:00:02Z");
+    expect(delayed.outcome).toBe("ignored");
+
+    const recovered = store.ingest(observation({
+      observer_instance_id: live,
+      sequence: 2,
+      sampled_at: "2026-08-15T16:00:30Z",
+      observed_at: "2026-08-15T16:00:31Z",
+      windows: windows(0.5),
+    }), "2026-08-15T16:00:32Z");
+    expect(recovered.outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T16:01:00Z");
+    expect(doctor[0]?.observer_instance_id).toBe(live);
+    expect(doctor[0]?.last_sequence).toBe(2);
+    expect(doctor[0]?.last_conflict?.kind).toBe("stale_observer_instance");
+    expect(store.snapshot("2026-08-15T16:01:00Z").pools[0]?.windows[0]?.utilization)
+      .toBe(0.5);
+    store.close();
+  });
+
+  test("doctor latest binding breaks last_seen_at ties by update order", async () => {
+    const { store } = await freshStore();
+    const observedAt = "2026-08-15T15:30:00Z";
+    expect(store.ingest(observation({
+      session_id: "session-old",
+      provider_subject: SUBJECT_A,
+      sequence: 1,
+      sampled_at: "2026-08-15T15:29:58Z",
+      observed_at: observedAt,
+      windows: windows(0.2),
+    }), "2026-08-15T15:30:01Z").outcome).toBe("accepted");
+    expect(store.ingest(observation({
+      session_id: "session-new",
+      provider_subject: SUBJECT_B,
+      sequence: 2,
+      sampled_at: "2026-08-15T15:29:58Z",
+      observed_at: observedAt,
+      windows: windows(0.4, "2026-08-15T19:00:00Z"),
+    }), "2026-08-15T15:30:02Z").outcome).toBe("conflict");
+
+    // Older-created session updated after the newer-created one, same
+    // last_seen_at. Creation-order rowid would keep reporting session-new's
+    // pool; update order must follow the later write. Bindings still persist
+    // on the conflict path.
+    expect(store.ingest(observation({
+      session_id: "session-old",
+      provider_subject: SUBJECT_A,
+      sequence: 3,
+      sampled_at: "2026-08-15T15:29:59Z",
+      observed_at: observedAt,
+      windows: windows(0.21),
+    }), "2026-08-15T15:30:03Z").outcome).toBe("conflict");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:31:00Z");
+    expect(doctor[0]?.pool_id?.endsWith(SUBJECT_A)).toBe(true);
+    expect(doctor[0]?.binding_confidence).toBe("subject");
+    store.close();
+  });
+
+  test("doctor latest observation breaks received_at ties by insertion order", async () => {
+    const { store } = await freshStore();
+    const receivedAt = "2026-08-15T15:30:01.000Z";
+    expect(store.ingest(observation({
+      sequence: 1,
+      sampled_at: "2026-08-15T15:29:00Z",
+      observed_at: "2026-08-15T15:29:01Z",
+      windows: windows(0.4),
+    }), receivedAt).outcome).toBe("accepted");
+    expect(store.ingest(observation({
+      sequence: 2,
+      sampled_at: "2026-08-15T15:30:00Z",
+      observed_at: "2026-08-15T15:30:01Z",
+      windows: windows(0.5),
+    }), receivedAt).outcome).toBe("accepted");
+
+    const doctor = store.doctorProfiles("2026-08-15T15:31:00Z");
+    expect(doctor[0]?.last_sequence).toBe(2);
+    expect(doctor[0]?.last_sampled_at).toBe("2026-08-15T15:30:00.000Z");
+    expect(doctor[0]?.last_outcome).toBe("accepted");
+    store.close();
+  });
+
   test("duplicate observation ids are idempotently acknowledged", async () => {
     const { store } = await freshStore();
     const item = observation({ sequence: 1, windows: windows(0.5) });

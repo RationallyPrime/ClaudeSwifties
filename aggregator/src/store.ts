@@ -22,6 +22,23 @@ import {
 const CURRENT_PROFILE_MS = 15 * 60 * 1_000;
 const RECENT_PROFILE_MS = 24 * 60 * 60 * 1_000;
 
+function parseConflictEvidence(raw: string | undefined): Record<string, unknown> {
+  if (raw === undefined) return {};
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 export interface StoreOptions {
   maxPools: number;
   maxFutureSkewMs: number;
@@ -64,7 +81,12 @@ export interface DoctorProfile {
   identity_evidence: string | null;
   identity_key_id: string | null;
   freshness: "current" | "recent" | "stale" | "never";
-  last_conflict: { kind: string; at: string } | null;
+  last_conflict: {
+    kind: string;
+    at: string;
+    presented_key_id?: string;
+    expected_key_id?: string;
+  } | null;
 }
 
 interface PoolRow {
@@ -91,6 +113,7 @@ interface BindingRow {
   source_host: string;
   last_seen_at: string;
   binding_confidence: BindingConfidence;
+  update_ordinal: number;
 }
 
 type ReconciliationDecision =
@@ -144,9 +167,9 @@ export class UsageStore {
 
     const bindings = this.db.query<BindingRow, []>(`
       SELECT profile_id, session_key, provider, pool_id, label, source_host,
-             last_seen_at, binding_confidence
+             last_seen_at, binding_confidence, update_ordinal
       FROM bindings
-      ORDER BY last_seen_at DESC, profile_id ASC
+      ORDER BY last_seen_at DESC, update_ordinal DESC, profile_id ASC
     `).all();
 
     const profilesByPool = new Map<string, Map<string, PoolProfile>>();
@@ -375,11 +398,15 @@ export class UsageStore {
       SELECT o.profile_id, o.sampled_at, o.outcome, o.payload_json
       FROM observations o
       JOIN (
-        SELECT profile_id, MAX(received_at) AS received_at
-        FROM observations GROUP BY profile_id
-      ) newest ON newest.profile_id = o.profile_id
-        AND newest.received_at = o.received_at
-      GROUP BY o.profile_id
+        SELECT profile_id, MAX(rowid) AS rowid
+        FROM observations
+        WHERE (profile_id, received_at) IN (
+          SELECT profile_id, MAX(received_at)
+          FROM observations
+          GROUP BY profile_id
+        )
+        GROUP BY profile_id
+      ) newest ON newest.rowid = o.rowid
     `).all();
     const latestByProfile = new Map(latest.map((row) => [row.profile_id, row]));
 
@@ -395,19 +422,24 @@ export class UsageStore {
       SELECT b.profile_id, b.pool_id, b.binding_confidence, b.last_seen_at
       FROM bindings b
       JOIN (
-        SELECT profile_id, MAX(last_seen_at) AS last_seen_at
-        FROM bindings GROUP BY profile_id
+        SELECT profile_id, MAX(update_ordinal) AS update_ordinal
+        FROM bindings
+        WHERE (profile_id, last_seen_at) IN (
+          SELECT profile_id, MAX(last_seen_at)
+          FROM bindings
+          GROUP BY profile_id
+        )
+        GROUP BY profile_id
       ) newest ON newest.profile_id = b.profile_id
-        AND newest.last_seen_at = b.last_seen_at
-      GROUP BY b.profile_id
+        AND newest.update_ordinal = b.update_ordinal
     `).all();
     const bindingByProfile = new Map(bindings.map((row) => [row.profile_id, row]));
 
     const conflicts = this.db.query<
-      { profile_id: string; kind: string; created_at: string },
+      { profile_id: string; kind: string; created_at: string; evidence_json: string },
       []
     >(`
-      SELECT c.profile_id, c.kind, c.created_at
+      SELECT c.profile_id, c.kind, c.created_at, c.evidence_json
       FROM conflicts c
       JOIN (
         SELECT profile_id, MAX(id) AS id FROM conflicts GROUP BY profile_id
@@ -415,6 +447,7 @@ export class UsageStore {
     `).all();
     const conflictByProfile = new Map(conflicts.map((row) => [row.profile_id, row]));
 
+    const sequenceByProfile = new Map(sequences.map((row) => [row.profile_id, row]));
     const profileIds = new Set<string>([
       ...sequences.map((row) => row.profile_id),
       ...receipts.map((row) => row.profile_id),
@@ -426,7 +459,7 @@ export class UsageStore {
     ]);
 
     return [...profileIds].sort().map((profileId): DoctorProfile => {
-      const sequence = sequences.find((row) => row.profile_id === profileId) ?? null;
+      const sequence = sequenceByProfile.get(profileId) ?? null;
       const receipt = receiptByProfile.get(profileId) ?? null;
       const newest = latestByProfile.get(profileId) ?? null;
       const binding = bindingByProfile.get(profileId) ?? null;
@@ -452,10 +485,14 @@ export class UsageStore {
       const age = lastReceived === null
         ? null
         : Math.max(0, generatedMs - Date.parse(lastReceived));
+      const conflictEvidence = parseConflictEvidence(conflict?.evidence_json);
+      const presentedKeyId = stringField(conflictEvidence, "presented_key_id");
+      const expectedKeyId = stringField(conflictEvidence, "expected_key_id");
+      const evidenceEdgeId = stringField(conflictEvidence, "edge_id");
       return {
         profile_id: profileId,
         observer_instance_id: sequence?.observer_instance_id ?? null,
-        edge_id: sequence?.edge_id ?? null,
+        edge_id: sequence?.edge_id ?? evidenceEdgeId,
         provider,
         first_seen_at: receipt?.first_seen_at ?? null,
         last_received_at: lastReceived,
@@ -465,7 +502,7 @@ export class UsageStore {
         pool_id: binding?.pool_id ?? null,
         binding_confidence: binding?.binding_confidence ?? null,
         identity_evidence: identityEvidence,
-        identity_key_id: identityKeyId,
+        identity_key_id: identityKeyId ?? presentedKeyId,
         freshness: age === null
           ? "never"
           : age <= CURRENT_PROFILE_MS
@@ -475,7 +512,12 @@ export class UsageStore {
               : "stale",
         last_conflict: conflict === null
           ? null
-          : { kind: conflict.kind, at: conflict.created_at },
+          : {
+            kind: conflict.kind,
+            at: conflict.created_at,
+            ...(presentedKeyId === null ? {} : { presented_key_id: presentedKeyId }),
+            ...(expectedKeyId === null ? {} : { expected_key_id: expectedKeyId }),
+          },
       };
     });
   }
@@ -578,6 +620,7 @@ export class UsageStore {
         source_host TEXT NOT NULL,
         last_seen_at TEXT NOT NULL,
         binding_confidence TEXT NOT NULL,
+        update_ordinal INTEGER NOT NULL,
         PRIMARY KEY (profile_id, session_key)
       );
 
@@ -626,6 +669,14 @@ export class UsageStore {
         evidence_json TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS retired_observer_instances (
+        profile_id TEXT NOT NULL,
+        observer_instance_id TEXT NOT NULL,
+        displaced_by TEXT NOT NULL,
+        retired_at TEXT NOT NULL,
+        PRIMARY KEY (profile_id, observer_instance_id)
+      );
+
       CREATE TABLE IF NOT EXISTS edge_rejections (
         edge_id TEXT PRIMARY KEY,
         count INTEGER NOT NULL,
@@ -640,6 +691,19 @@ export class UsageStore {
 
       PRAGMA user_version = 5;
     `);
+
+    const bindingSchema = this.db.query<{ sql: string }, [string]>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get("bindings")?.sql;
+    if (bindingSchema && !bindingSchema.includes("update_ordinal")) {
+      // Bindings are updated in place, so rowid stays creation order. Existing
+      // rows keep their relative creation order; later writes mint a new
+      // ordinal past that range.
+      this.db.exec(`
+        ALTER TABLE bindings ADD COLUMN update_ordinal INTEGER NOT NULL DEFAULT 0;
+        UPDATE bindings SET update_ordinal = rowid;
+      `);
+    }
   }
 
   /**
@@ -770,11 +834,36 @@ export class UsageStore {
     ).get(observation.profile_id);
 
     // The sequence high-water mark is scoped to one installation generation:
-    // (observer_instance_id, sequence). A different instance is a legitimate
-    // reinstall/relocation whose counter starts over — never silently ignored
-    // against the previous installation's mark.
+    // (observer_instance_id, sequence). A never-retired instance whose
+    // observed_at is newer than the profile's last recorded sample is a
+    // legitimate reinstall/relocation whose counter starts over. An unseen
+    // older instance — typically a delayed spool — must not retire the
+    // current collector. A recently-reporting displaced instance stays
+    // eligible; only a stale one is retired and cannot rotate back.
     const sameInstance =
       sequence?.observer_instance_id === observation.observer_instance_id;
+    if (
+      consumeSequence &&
+      this.isRetiredObserverInstance(
+        observation.profile_id,
+        observation.observer_instance_id,
+      )
+    ) {
+      // A known displaced generation cannot become current again. A delayed
+      // or newly queued observation from the retired instance used to rotate
+      // the active row (and its bindings) back onto the stale pool.
+      this.recordConflict(observation, "retired_observer_instance", null, null, receivedAt, {
+        retired_observer_instance_id: observation.observer_instance_id,
+        current_observer_instance_id: sequence?.observer_instance_id ?? null,
+        current_last_sequence: sequence?.last_sequence ?? null,
+      });
+      this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
+      return {
+        observation_id: observation.observation_id,
+        outcome: "ignored",
+        clock_skewed: clockSkewed,
+      };
+    }
     if (
       consumeSequence &&
       sequence &&
@@ -803,9 +892,35 @@ export class UsageStore {
     }
 
     if (consumeSequence && sequence && !sameInstance) {
+      // Receipt time cannot order generations: a delayed spool arrives now.
+      // Compare the incoming sample against every recorded observation —
+      // including ignored heartbeats — so an unseen older instance cannot
+      // retire a live one. A missing timestamp cannot establish that the
+      // incoming generation is newer, so refuse the switch.
+      const lastObservedAt = this.latestRecordedObservedAt(observation.profile_id);
+      const incomingIsNewer = lastObservedAt !== null &&
+        Date.parse(observation.observed_at) > Date.parse(lastObservedAt);
+      if (!incomingIsNewer) {
+        this.recordConflict(observation, "stale_observer_instance", null, null, receivedAt, {
+          current_observer_instance_id: sequence.observer_instance_id,
+          current_last_sequence: sequence.last_sequence,
+          current_last_observed_at: lastObservedAt,
+          incoming_observer_instance_id: observation.observer_instance_id,
+          incoming_observed_at: observation.observed_at,
+        });
+        this.recordObservation(observation, receivedAt, "ignored", null, clockSkewed, sessionKey);
+        return {
+          observation_id: observation.observation_id,
+          outcome: "ignored",
+          clock_skewed: clockSkewed,
+        };
+      }
+
       // Two live installations of one profile competing for its sequence is
       // configuration evidence, not something to resolve silently. Preserve
-      // it whenever the displaced instance reported recently.
+      // it whenever the displaced instance reported recently: record the
+      // conflict and keep both generations ingesting. Retirement is
+      // irreversible, so it is reserved for a stale displaced instance.
       const displacedRecently =
         sequence.observer_instance_id !== null &&
         sequence.updated_at !== null &&
@@ -823,6 +938,14 @@ export class UsageStore {
             displaced_last_sequence: sequence.last_sequence,
             incoming_observer_instance_id: observation.observer_instance_id,
           },
+        );
+      }
+      if (sequence.observer_instance_id !== null && !displacedRecently) {
+        this.retireObserverInstance(
+          observation.profile_id,
+          sequence.observer_instance_id,
+          observation.observer_instance_id,
+          receivedAt,
         );
       }
     }
@@ -848,7 +971,7 @@ export class UsageStore {
 
     const existingBinding = this.db.query<BindingRow, [string, string]>(`
       SELECT profile_id, session_key, provider, pool_id, label, source_host,
-             last_seen_at, binding_confidence
+             last_seen_at, binding_confidence, update_ordinal
       FROM bindings WHERE profile_id = ? AND session_key = ?
     `).get(observation.profile_id, sessionKey);
 
@@ -1570,18 +1693,22 @@ export class UsageStore {
     const lastSeen = previous && Date.parse(previous.last_seen_at) > Date.parse(observation.observed_at)
       ? previous.last_seen_at
       : observation.observed_at;
+    const updateOrdinal = (this.db.query<{ n: number }, []>(
+      "SELECT COALESCE(MAX(update_ordinal), 0) + 1 AS n FROM bindings",
+    ).get()?.n ?? 1);
     this.db.query(`
       INSERT INTO bindings (
         profile_id, session_key, provider, pool_id, label, source_host,
-        last_seen_at, binding_confidence
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        last_seen_at, binding_confidence, update_ordinal
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(profile_id, session_key) DO UPDATE SET
         provider = excluded.provider,
         pool_id = excluded.pool_id,
         label = excluded.label,
         source_host = excluded.source_host,
         last_seen_at = excluded.last_seen_at,
-        binding_confidence = excluded.binding_confidence
+        binding_confidence = excluded.binding_confidence,
+        update_ordinal = excluded.update_ordinal
     `).run(
       observation.profile_id,
       sessionKey,
@@ -1591,6 +1718,7 @@ export class UsageStore {
       observation.source_host,
       lastSeen,
       confidence,
+      updateOrdinal,
     );
   }
 
@@ -1684,6 +1812,38 @@ export class UsageStore {
       receivedAt,
       JSON.stringify(observation),
     );
+  }
+
+  private latestRecordedObservedAt(profileId: string): string | null {
+    return this.db.query<{ observed_at: string | null }, [string]>(`
+      SELECT MAX(observed_at) AS observed_at
+      FROM observations
+      WHERE profile_id = ?
+    `).get(profileId)?.observed_at ?? null;
+  }
+
+  private isRetiredObserverInstance(
+    profileId: string,
+    observerInstanceId: string,
+  ): boolean {
+    return this.db.query<{ present: number }, [string, string]>(`
+      SELECT 1 AS present FROM retired_observer_instances
+      WHERE profile_id = ? AND observer_instance_id = ?
+    `).get(profileId, observerInstanceId) != null;
+  }
+
+  private retireObserverInstance(
+    profileId: string,
+    observerInstanceId: string,
+    displacedBy: string,
+    retiredAt: string,
+  ): void {
+    this.db.query(`
+      INSERT INTO retired_observer_instances (
+        profile_id, observer_instance_id, displaced_by, retired_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(profile_id, observer_instance_id) DO NOTHING
+    `).run(profileId, observerInstanceId, displacedBy, retiredAt);
   }
 
   private recordConflict(

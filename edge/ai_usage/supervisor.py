@@ -37,15 +37,23 @@ DIAGNOSTIC_LIMIT = 64 * 1024
 # the observation, so it is permanent for that payload, not credential
 # rotation — rotation is 401), or a namespace rejection (422). The status
 # alone is never sufficient: any hop (HTTPS ingress, tunnel, WAF) produces
-# the same integers, so quarantine additionally requires the aggregator's
-# own JSON error document (DeliveryFailure.aggregator_error). 413 is
-# deliberately absent — the edge refuses oversize payloads at encode
-# (MAX_OBSERVATION_BYTES matches the aggregator's MAX_BODY_BYTES), so a
-# wire 413 is an ingress body limit, always transient. Everything else
-# (401, 408/429 pressure, 5xx, network) stays on the transient backoff
-# path: retrying those is harmless, retrying a true content verdict
-# wedges the spool head forever.
+# the same integers, and a generic JSON ``error`` string is the same
+# shape those hops emit. Quarantine requires a named member of
+# PERMANENT_REJECTION_ERRORS whose observation_id matches the queued
+# item. 413 is deliberately absent — the edge refuses oversize payloads
+# at encode (MAX_OBSERVATION_BYTES matches the aggregator's MAX_BODY_BYTES),
+# so a wire 413 is an ingress body limit, always transient. Everything
+# else (401, 408/429 pressure, 5xx, network, unknown codes) stays on the
+# transient backoff path: retrying those is harmless, retrying a true
+# content verdict wedges the spool head forever.
 PERMANENT_REJECTION_STATUSES = frozenset({400, 403, 422})
+PERMANENT_REJECTION_ERRORS = frozenset(
+    {
+        "invalid_observation",
+        "forbidden_claim",
+        "identity_key_mismatch",
+    }
+)
 
 
 @dataclasses.dataclass
@@ -432,17 +440,18 @@ class Supervisor:
             except DeliveryFailure as error:
                 if (
                     error.status in PERMANENT_REJECTION_STATUSES
-                    and error.aggregator_error is not None
+                    and error.aggregator_error in PERMANENT_REJECTION_ERRORS
+                    and error.aggregator_observation_id
+                    == pending.observation.observation_id
                 ):
-                    # A content verdict about THIS observation (schema or
-                    # namespace rejection), not a transient transport state:
-                    # retrying can never succeed, and backing off head-of-line
-                    # blocks every observation behind it — the wedge Theoros
-                    # reproduced on the identity-key 422. Both conditions are
-                    # required: the status names the verdict class, the
-                    # aggregator's own error document proves the verdict came
-                    # from the aggregator and not an intermediary. Quarantine
-                    # and keep draining.
+                    # A named content verdict about THIS observation, not a
+                    # transient transport state and not a generic JSON error
+                    # an intermediary can emit. Retrying a true content
+                    # verdict wedges the spool head; quarantining a WAF 403
+                    # destroys observations that would deliver once the
+                    # ingress is fixed. Membership in the closed code set
+                    # plus a matching observation_id is the refuse path.
+                    # Quarantine and keep draining.
                     self.spool.quarantine(
                         pending.path,
                         "permanently rejected by the aggregator: "

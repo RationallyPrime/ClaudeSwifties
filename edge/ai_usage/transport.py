@@ -31,6 +31,14 @@ class Acknowledgement:
     clock_skewed: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class AggregatorErrorDocument:
+    """Fields the drain needs to decide permanence. Extraction is not a verdict."""
+
+    code: str
+    observation_id: str
+
+
 class DeliveryFailure(TransportError):
     def __init__(
         self,
@@ -39,27 +47,28 @@ class DeliveryFailure(TransportError):
         status: int | None = None,
         retry_after: float | None = None,
         aggregator_error: str | None = None,
+        aggregator_observation_id: str | None = None,
     ):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
-        # The ``error`` token from an aggregator-shaped JSON error document,
-        # or None when the response could have come from any other hop
-        # (ingress, tunnel, WAF). Permanence classification requires it: a
-        # bare status integer is not an aggregator verdict.
+        # The aggregator's closed ``code`` token, or None when the response
+        # is not a bindable aggregator error document. Permanence is decided
+        # by the drain against PERMANENT_REJECTION_ERRORS, never here.
         self.aggregator_error = aggregator_error
+        self.aggregator_observation_id = aggregator_observation_id
 
 
-def _aggregator_error_code(error: urllib.error.HTTPError) -> str | None:
-    """The ``error`` token from an aggregator-shaped JSON error document.
+def _parse_aggregator_error_document(
+    error: urllib.error.HTTPError,
+) -> AggregatorErrorDocument | None:
+    """Extract ``code`` and ``observation_id`` from an aggregator error document.
 
-    A permanent rejection must be the aggregator's own verdict about the
-    payload. Intermediaries (HTTPS ingress, tunnel, WAF) produce the same
-    status integers with HTML or empty bodies; treating those as payload
-    verdicts destroys queued observations that would deliver fine once the
-    ingress is fixed. Recognition is strict: JSON content type, bounded
-    body, a JSON object carrying a non-empty string ``error`` field —
-    anything else returns None and stays on the transient backoff path.
+    A generic JSON object with any nonempty ``error`` string is what an
+    ingress, tunnel, or WAF can emit. That shape is not provenance. The
+    aggregator names a closed ``code`` and echoes the observation id; the
+    drain then default-denies every other code. Anything else returns None
+    and stays on the transient backoff path.
     """
     content_type = ""
     if error.headers is not None:
@@ -78,10 +87,22 @@ def _aggregator_error_code(error: urllib.error.HTTPError) -> str | None:
         return None
     if not isinstance(document, dict):
         return None
-    code = document.get("error")
-    if isinstance(code, str) and code:
-        return code
+    code = document.get("code")
+    observation_id = document.get("observation_id")
+    if (
+        isinstance(code, str)
+        and code
+        and isinstance(observation_id, str)
+        and observation_id
+    ):
+        return AggregatorErrorDocument(code, observation_id)
     return None
+
+
+def _aggregator_error_code(error: urllib.error.HTTPError) -> str | None:
+    """The closed ``code`` token, or None when the document is not bindable."""
+    document = _parse_aggregator_error_document(error)
+    return None if document is None else document.code
 
 
 def _retry_after(headers: Message | None) -> float | None:
@@ -128,11 +149,15 @@ class ObservationTransport:
         except urllib.error.HTTPError as error:
             # Never stringify HTTPError or Request: both can retain the
             # Authorization header in object state.
+            verdict = _parse_aggregator_error_document(error)
             raise DeliveryFailure(
                 f"aggregator returned HTTP {error.code}",
                 status=error.code,
                 retry_after=_retry_after(error.headers),
-                aggregator_error=_aggregator_error_code(error),
+                aggregator_error=None if verdict is None else verdict.code,
+                aggregator_observation_id=(
+                    None if verdict is None else verdict.observation_id
+                ),
             ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise DeliveryFailure(
